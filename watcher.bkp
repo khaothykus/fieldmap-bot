@@ -1,0 +1,230 @@
+# watcher.py
+import os
+import time
+import logging
+import argparse
+import glob
+from datetime import datetime
+
+from portal_client import PortalClient
+from ocr_utils import extrair_dados_comprovante
+from dedupe import file_hash, already_done, mark_done
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+class Watcher:
+    def __init__(self, pasta_comprovantes="comprovantes"):
+        self.pasta = pasta_comprovantes
+        headless = os.getenv("HEADLESS", "0") == "1"
+        self.pc = PortalClient(headless=headless)
+        # login uma vez
+        self.pc.login()
+
+        # prepara pastas
+        for p in ("processados", "falhos", "duplicados"):
+            os.makedirs(os.path.join(self.pasta, "..", p), exist_ok=True)
+
+    def _mover(self, path, destino):
+        base = os.path.basename(path)
+        tgt = os.path.join(os.path.dirname(self.pasta), destino, base)
+        try:
+            os.replace(path, tgt)
+        except Exception:
+            try:
+                # queda de rede/lock: tenta fallback copy+remove
+                import shutil
+
+                shutil.copy2(path, tgt)
+                os.remove(path)
+            except Exception:
+                pass
+
+    def processar(self, path: str):
+        logging.info(f"Novo arquivo: {path}")
+        try:
+            # --- dedupe ---
+            h = file_hash(path)
+            if already_done(h):
+                logging.info("Arquivo já processado (hash conhecido) — ignorando.")
+                self._mover(path, "duplicados")
+                return
+
+            # # --- OCR ---
+            # dados = extrair_dados_comprovante(path)
+            # logging.info(
+            #     f"OCR: tipo={dados.tipo} data={dados.data} valor_centavos={dados.valor_centavos}"
+            # )
+
+            # # --- localizar deslocamento -> HREF de 'Despesas' ---
+            # href = self.pc.encontrar_linha_por_data_hora(dados.data, dados.tipo)
+            # if not href:
+            #     logging.warning("Nenhuma linha correspondente ao horário. Tentando última linha...")
+            #     href = self.pc.encontrar_ultima_linha()
+            # if not href:
+            #     raise RuntimeError("Não consegui encontrar o link de despesas (href).")
+
+            # # --- ir direto por URL /Despesa/Index ---
+            # self.pc.abrir_despesas(href)
+
+            # # --- preencher/anexar/salvar/confirmar ---
+            # ok = self.pc.preencher_e_anexar(dados.tipo, dados.valor_centavos, path)
+            # if not ok:
+            #     raise RuntimeError("Falha ao salvar a despesa (sem confirmação).")
+
+            # # --- sucesso: grava dedupe e move ---
+            # mark_done(
+            #     h,
+            #     tipo=dados.tipo,
+            #     data=dados.data.isoformat(),
+            #     valor_centavos=dados.valor_centavos,
+            #     nome_arquivo=os.path.basename(path),
+            # )
+            # logging.info("✔ Despesa lançada e comprovante anexado com sucesso.")
+            # self._mover(path, "processados")
+            
+            
+            # --- OCR ---
+            dados = extrair_dados_comprovante(path)
+            logging.info(f"OCR: tipo={dados.tipo} data={dados.data} valor_centavos={dados.valor_centavos}")
+
+            # --- Validação de campos obrigatórios ---
+            if (
+                not dados.tipo
+                or dados.tipo == "desconhecido"
+                or not dados.data
+                or not isinstance(dados.valor_centavos, int)
+                or dados.valor_centavos <= 0
+            ):
+                logging.error("OCR incompleto ou inválido — tipo, data ou valor ausentes/incorretos. Nada foi lançado.")
+                self._mover(path, "falhos")
+                return
+
+            # 1) acha a linha certa; se não achar, NÃO anexa
+            href = self.pc.encontrar_linha_por_data_hora(dados.data, dados.tipo)
+            if not href:
+                logging.error("Não encontrei linha correspondente ao horário/mês do comprovante. Nada foi lançado.")
+                self._mover(path, "falhos")
+                return
+
+            # 2) abre a página /Despesa/Index exata e tenta lançar
+            ok = self.pc.abrir_despesas_por_href(href) and \
+                self.pc.preencher_e_anexar(dados.tipo, dados.valor_centavos, path, data_evento=dados.data)
+
+            if not ok:
+                logging.error("Validação falhou ou não houve confirmação. Nada foi lançado.")
+                self._mover(path, "falhos")
+                return
+
+            # 3) sucesso
+            mark_done(file_hash(path), tipo=dados.tipo, data=dados.data.isoformat(),
+                    valor_centavos=dados.valor_centavos, nome_arquivo=os.path.basename(path))
+            logging.info("✔ Despesa lançada e comprovante anexado com sucesso.")
+            self._mover(path, "processados")
+
+        except Exception as e:
+            logging.exception(f"ERRO ao processar {path}: {e}")
+            self._mover(path, "falhos")
+            
+    def reprocessar_falhos(self, max_por_passada: int = 10):
+        """
+        Varre a pasta 'falhos/' e tenta reprocessar cada arquivo reaproveitando o mesmo fluxo do watcher.
+        Se der certo, o próprio processar() move para 'processados' e grava no ledger.
+        Se falhar novamente, ele volta para 'falhos'.
+        """
+        base = os.path.dirname(os.path.abspath(__file__))
+        pasta_falhos = os.path.join(base, "falhos")
+        if not os.path.isdir(pasta_falhos):
+            return
+
+        # pega uma lista estável (evita confusão enquanto move)
+        arquivos = [
+            f for f in glob.glob(os.path.join(pasta_falhos, "*"))
+            if os.path.isfile(f)
+        ]
+        # reprocessa poucos por passada pra não travar o loop principal
+        arquivos = sorted(arquivos, key=os.path.getmtime)[:max_por_passada]
+
+        if not arquivos:
+            return
+
+        logging.info(f"[auto-retry] Reprocessando {len(arquivos)} arquivo(s) de 'falhos/'...")
+        for path in arquivos:
+            try:
+                self.processar(path)
+                time.sleep(0.5)  # um respiro ajuda o portal
+            except Exception as e:
+                logging.exception(f"[auto-retry] Falhou ao reprocessar {os.path.basename(path)}: {e}")
+
+
+    def main(self):
+        logging.info(f"Watcher iniciado. Aguardando comprovantes em {self.pasta}")
+        vistos = set()
+        while True:
+            try:
+                arquivos = [
+                    os.path.join(self.pasta, f)
+                    for f in os.listdir(self.pasta)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                ]
+            except FileNotFoundError:
+                os.makedirs(self.pasta, exist_ok=True)
+                arquivos = []
+
+            novos = [f for f in arquivos if f not in vistos]
+            for path in novos:
+                vistos.add(path)
+                self.processar(path)
+
+            time.sleep(2)
+
+
+# if __name__ == "__main__":
+#     try:
+#         Watcher().main()
+#     except KeyboardInterrupt:
+#         logging.info("Encerrado pelo usuário.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Watcher de comprovantes com auto-retry dos falhos.")
+    parser.add_argument("--retry-interval", type=int, default=0,
+                        help="Intervalo (minutos) para reprocessar a pasta 'falhos/'. 0 = desativado.")
+    args = parser.parse_args()
+
+    try:
+        w = Watcher()  # mantém o navegador aberto como você já está usando
+        logging.info(f"Watcher iniciado. Aguardando comprovantes em {w.pasta}")
+
+        ultimo_retry = 0
+        intervalo_seg = max(0, args.retry_interval) * 60
+
+        while True:
+            # --- loop padrão do watcher (o seu conteúdo atual) ---
+            arquivos = [
+                os.path.join(w.pasta, f)
+                for f in os.listdir(w.pasta)
+                if f.lower().endswith((".jpg", ".jpeg", ".png"))
+            ]
+            # simples dedupe de varredura
+            for path in arquivos:
+                # se seu watcher já controle 'vistos', mantenha sua lógica de vistos aqui
+                try:
+                    w.processar(path)
+                except Exception as e:
+                    logging.exception(f"ERRO ao processar {path}: {e}")
+
+            # --- auto-retry de 'falhos/' quando chegar o momento ---
+            if intervalo_seg > 0:
+                agora = time.time()
+                if agora - ultimo_retry >= intervalo_seg:
+                    w.reprocessar_falhos(max_por_passada=10)
+                    ultimo_retry = agora
+
+            time.sleep(2)
+
+    except KeyboardInterrupt:
+        logging.info("Encerrado pelo usuário.")
+

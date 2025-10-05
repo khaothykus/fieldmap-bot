@@ -1,0 +1,19 @@
+login:
+  url: "https://mobile.ncratleos.com/sb0121/"
+  user_selector: "input#UserName"
+  pass_selector: "input#Password"
+  submit_selector: "button[type='submit']"
+
+veiculo:
+  url: "https://mobile.ncratleos.com/sb0121/SelecionarVeiculo/Index"
+  salvar_selector: "button.btn.btn-success"
+
+tabela:
+  url: "https://mobile.ncratleos.com/sb0121/Deslocamento/Index"
+  row_selector: "table tbody tr"
+
+form:
+  tipo_selector: "select#Tipo"
+  valor_selector: "input#Valor"
+  anexar_input_selector: "input[type='file']"
+  salvar_selector: "button.btn.btn-success[type='submit']"

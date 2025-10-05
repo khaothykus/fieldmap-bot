@@ -1,0 +1,155 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+from PIL import Image, ImageOps, ImageFilter
+import pytesseract
+
+
+@dataclass
+class DadosOCR:
+    tipo: str               # "pedagio" | "estacionamento"
+    data: datetime          # quando ocorreu
+    valor_centavos: int     # em centavos (p.ex. 265 = R$ 2,65)
+
+
+# -------------------- util --------------------
+
+def _ascii_fold(s: str) -> str:
+    """Remove acentos e normaliza espaços para melhorar casamento de regex."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # normaliza espaços e pontuação “exótica”
+    s = s.replace("\u00a0", " ").replace("\u200b", "")  # NBSP e zero-width
+    return s
+
+
+# -------------------- OCR --------------------
+
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    g = ImageOps.grayscale(img)
+    g = ImageOps.autocontrast(g)
+    g = g.filter(ImageFilter.SHARPEN)
+    return g
+
+
+def _ocr_texto(path_img: str) -> str:
+    with Image.open(path_img) as im:
+        im = _preprocess_image(im)
+        cfg = "--psm 6"
+        try:
+            txt = pytesseract.image_to_string(im, lang="por", config=cfg)
+        except Exception:
+            txt = pytesseract.image_to_string(im, config=cfg)
+
+        if len((txt or "").strip()) < 10:
+            try:
+                raw = pytesseract.image_to_string(Image.open(path_img), lang="por", config=cfg)
+                if len((raw or "").strip()) > len((txt or "").strip()):
+                    txt = raw
+            except Exception:
+                pass
+
+        return txt or ""
+
+
+# -------------------- parsing --------------------
+
+def _parse_valor_centavos(texto: str, texto_fold: str) -> Optional[int]:
+    # 1) padrões com R$
+    m = re.search(r"r\$\s*([\d\.]+,\d{2})", texto, re.IGNORECASE)
+    if not m:
+        # 2) "Valor: 4,25"
+        m = re.search(r"\bvalor\s*[:\-]?\s*([\d\.]+,\d{2})", texto, re.IGNORECASE)
+    if not m:
+        # 3) fallback: usa dobrado no texto sem acento p/ tolerar OCR ruim
+        m = re.search(r"\bvalor\b.*?([\d\.]+,\d{2})", texto_fold, re.IGNORECASE | re.DOTALL)
+
+    if not m:
+        return None
+
+    br = m.group(1).strip()
+    try:
+        return int(round(float(br.replace(".", "").replace(",", ".")) * 100))
+    except Exception:
+        return None
+
+
+def _parse_data_ptbr(texto: str) -> Optional[datetime]:
+    """
+    Suporta:
+      - Zul+/Estapar: 'Ativação: 15/09 às 10:41' (ano opcional)
+      - Vaga Legal:  'Início: 08/09/2025 10:23[:53]'
+      - Genérico:    'dd/mm[/aaaa] hh:mm'
+    """
+    t = texto
+    tf = _ascii_fold(t).lower()
+
+    # ---------------- Zul+/Estapar ----------------
+    # procurar por 'ativacao' (sem acento) e, depois, data + (qualquer coisa não-digit) + hh:mm
+    m = re.search(
+        r"ativacao\s*[:\-]?\s*(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\D+(\d{1,2}):(\d{2})",
+        tf, re.IGNORECASE
+    )
+    if m:
+        d, mo, y, hh, mm = m.groups()
+        year = int(y) if y else datetime.now().year
+        return datetime(year, int(mo), int(d), int(hh), int(mm), 0)
+
+    # ---------------- Vaga Legal (Início) ----------------
+    for lab in ("Início", "Inicio", "In\u00edcio"):
+        m = re.search(
+            rf"{lab}\s*[:\-]?\s*(\d{{2}})/(\d{{2}})/(\d{{4}})\s*(\d{{2}}):(\d{{2}})(?::(\d{{2}}))?",
+            t, re.IGNORECASE
+        )
+        if m:
+            d, mo, y, hh, mm, ss = m.groups()
+            return datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss or 0))
+
+    # ---------------- Genérico ----------------
+    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\s+(\d{1,2}):(\d{2})", t)
+    if m:
+        d, mo, y, hh, mm = m.groups()
+        year = int(y) if y else datetime.now().year
+        return datetime(year, int(mo), int(d), int(hh), int(mm), 0)
+
+    return None
+
+
+# -------------------- API --------------------
+
+def extrair_dados_comprovante(path_img: str) -> DadosOCR:
+    """
+    Lê SOMENTE o conteúdo do arquivo (nunca o nome) e retorna:
+      - tipo ('pedagio' | 'estacionamento')
+      - data (datetime)
+      - valor_centavos (int)
+    """
+    texto = _ocr_texto(path_img)
+    tf = _ascii_fold(texto).lower()
+
+    # Tipo
+    tipo = "pedagio" if ("pedagio" in tf or "pedágio" in texto.lower()) else "estacionamento"
+
+    # Valor
+    valor_centavos = _parse_valor_centavos(texto, tf) or 0
+
+    # Data
+    dt = _parse_data_ptbr(texto)
+    if dt is None:
+        # último recurso: tenta em texto “folded” um padrão dd/mm hh:mm
+        m = re.search(r"(\d{1,2})/(\d{1,2})\D+(\d{1,2}):(\d{2})", tf)
+        if m:
+            d, mo, hh, mm = m.groups()
+            dt = datetime(datetime.now().year, int(mo), int(d), int(hh), int(mm), 0)
+        else:
+            dt = datetime.now()  # ainda deixo explícito para o log do watcher
+
+    return DadosOCR(tipo=tipo, data=dt, valor_centavos=valor_centavos)
