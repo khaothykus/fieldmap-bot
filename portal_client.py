@@ -1,11 +1,12 @@
 # portal_client.py
-import os, time, yaml
+import os, time, yaml, platform
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode
 from typing import Optional
 
 from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -16,35 +17,74 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException,
     StaleElementReferenceException,
 )
-from dotenv import load_dotenv
+import shutil
 
+from dotenv import load_dotenv
 load_dotenv()
 
 
 class PortalClient:
-    """
-    Cliente do portal FieldMap Web, focado em:
-      - login (com tela de selecionar veículo)
-      - posicionar período da grade pelo mês do comprovante
-      - localizar deslocamento pela data/hora (regra pedágio/estacionamento)
-      - abrir a tela de despesas via HREF do menu da linha
-      - preencher/anexar e confirmar o lançamento na grade
-    """
-
-    def __init__(self, config_path="config.yaml", headless=False):
+    def __init__(self, config_path="config.yaml", headless: bool = False):
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f) or {}
 
+        # --- Firefox Options ---
         o = Options()
         if headless:
+            # Firefox aceita "-headless" (ou "--headless")
             o.add_argument("-headless")
 
-        self.driver = webdriver.Firefox(options=o)
+        # Força comportamento "desktop" (ajuda muito no headless/ESR)
+        o.set_preference(
+            "general.useragent.override",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+        )
+        o.set_preference("intl.accept_languages", "pt-BR,pt,en-US,en")
+
+        # --- Cria o driver (Windows x Linux/ARM) ---
+        self.driver = self._make_driver(options=o)
         self.wait = WebDriverWait(self.driver, 20)
+
+        # Tamanho de janela SEMPRE após criar o driver
         try:
-            self.driver.set_window_size(1440, 900)
+            self.driver.set_window_size(1400, 950)
         except Exception:
             pass
+
+    def _make_driver(self, options: Options):
+        """
+        Cria o Firefox WebDriver corretamente em:
+        - Windows (geckodriver no PATH)
+        - Raspberry Pi (aarch64) com firefox-esr e geckodriver instalados via apt
+        - Respeita ENV: FIREFOX_BIN e GECKODRIVER
+        """
+        system = platform.system().lower()
+        arch = platform.machine().lower()
+
+        # ENV primeiro (para você controlar pelo service/.env)
+        firefox_bin = (os.getenv("FIREFOX_BIN") or "").strip()
+        gecko_bin = (os.getenv("GECKODRIVER") or "").strip()
+
+        # Defaults amigáveis no Pi
+        if not firefox_bin and (system == "linux" and arch in ("aarch64", "arm64", "armv7l", "armv8")):
+            if os.path.exists("/usr/bin/firefox-esr"):
+                firefox_bin = "/usr/bin/firefox-esr"
+        if not gecko_bin:
+            # tenta which; se não, fallback comum no Pi
+            gecko_bin = shutil.which("geckodriver") or "/usr/local/bin/geckodriver"
+
+        if firefox_bin and os.path.exists(firefox_bin):
+            options.binary_location = firefox_bin
+
+        service = None
+        if gecko_bin and os.path.exists(gecko_bin):
+            service = Service(executable_path=gecko_bin)
+
+        if service is not None:
+            return webdriver.Firefox(service=service, options=options)
+        else:
+            # Deixa o Selenium Manager resolver (x86/windows, etc.)
+            return webdriver.Firefox(options=options)
 
     # -------------- utilidades --------------
     def close(self):
@@ -79,37 +119,195 @@ class PortalClient:
             el.dispatchEvent(new Event('change', {bubbles:true}));
         """, el, value_str)
 
-    def _fixar_periodo_do_mes(self, data_ref: datetime):
-        """Garante que o período da grade é exatamente o mês de data_ref e clica Pesquisar."""
+    def _is_login_page(self) -> bool:
+        d = self.driver
+        try:
+            sel_user = self.cfg["login"]["user_selector"]
+            sel_pass = self.cfg["login"]["pass_selector"]
+            d.find_element(By.CSS_SELECTOR, sel_user)
+            d.find_element(By.CSS_SELECTOR, sel_pass)
+            return True
+        except Exception:
+            return False
+        
+    def _env_creds(self):
+        """Lê credenciais somente de PORTAL_USER/PORTAL_PASS."""
+        import os
+        user = os.getenv("PORTAL_USER", "").strip()
+        pwd  = os.getenv("PORTAL_PASS", "").strip()
+        return user, pwd
+
+    # -------------- login / navegação inicial --------------
+    def _do_login(self):
+        """
+        Faz login se (e somente se) detectar a tela de login.
+        Usa selectors do config.yaml e respeita __RequestVerificationToken,
+        pois o submit é feito pelo próprio botão do formulário.
+        """
         d, w = self.driver, self.wait
-        if "/Deslocamento/Index" not in (d.current_url or ""):
-            d.get(self.cfg["tabela"]["url"])
+        login_url = self.cfg["login"]["url"].rstrip("/") + "/"
+        user_sel  = self.cfg["login"]["user_selector"]
+        pass_sel  = self.cfg["login"]["pass_selector"]
+        subm_sel  = self.cfg["login"]["submit_selector"]
 
-        # limites do mês
-        ini = data_ref.replace(day=1)
-        prox = (ini.replace(day=28) + timedelta(days=4)).replace(day=1)
-        fim = prox - timedelta(days=1)
+        # Se não estamos na tela de login, tenta ir pra lá
+        if "login" in (d.title or "").lower() or "/sb0121/" in (d.current_url or ""):
+            pass
+        else:
+            d.get(login_url)
 
-        def fdate(dt): return f"{dt.day:02d}/{dt.month:02d}/{dt.year}"
+        # Verifica se realmente é a tela de login (UserName/Password existem)
+        try:
+            usr = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, user_sel)))
+            pwd = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, pass_sel)))
+        except TimeoutException:
+            # Pode já estar logado; sai sem erro
+            return
 
-        inp_ini = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input#dataInicialPesquisa")))
-        inp_fim = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input#dataFinalPesquisa")))
-        self._set_input_value_js(inp_ini, fdate(ini))
-        self._set_input_value_js(inp_fim, fdate(fim))
+        user, passw = self._env_creds()
+        if not user or not passw:
+            raise RuntimeError("Credenciais ausentes (.env: PORTAL_USER/PORTAL_PASS).")
 
-        # botão Pesquisar
-        btn = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-success.mb-2.ml-2, button.btn.btn-success")))
+        # Preenche e envia
+        usr.clear(); usr.send_keys(user)
+        pwd.clear(); pwd.send_keys(passw)
+
+        # Clica no botão de login (leva o token oculto junto)
+        btn = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, subm_sel)))
         self._scroll_center(btn)
         self._robust_click(btn)
-        # espera a grade renderizar
-        w.until(EC.visibility_of_element_located((By.CSS_SELECTOR, self.cfg["tabela"]["row_selector"])))
-        time.sleep(0.2)
 
+        # Aguarda sair da tela de login (título muda e/ou URL muda)
+        w.until(lambda drv: "login" not in (drv.title or "").lower())
+
+    def ensure_on_deslocamento_index(self):
+        """
+        Garante sessão e navega até a grade de deslocamentos.
+        Resolve o seu caso em que a automação ficava presa no login.
+        """
+        d, w = self.driver, self.wait
+        # Se título indica login, efetua login
+        if "login - fieldmap web" in (d.title or "").lower():
+            self._do_login()
+
+        # Vai para a grade
+        url = self.cfg["tabela"]["url"]
+        if not d.current_url or "/Deslocamento/Index" not in d.current_url:
+            d.get(url)
+
+        # Se redirecionar para login (sessão expirada), faz login e volta
+        if "login - fieldmap web" in (d.title or "").lower():
+            self._do_login()
+            d.get(url)
+
+        # Aguarda a grade carregar: ou linhas, ou “Buscar registros”, ou “sem registros”
+        row_sel = self.cfg["tabela"]["row_selector"]
+        try:
+            w.until(
+                lambda drv: (
+                    drv.find_elements(By.CSS_SELECTOR, row_sel) or
+                    drv.find_elements(By.CSS_SELECTOR, "input[placeholder*='Buscar']") or
+                    drv.page_source.lower().find("sem registros") >= 0
+                )
+            )
+        except TimeoutException:
+            # Salva HTML de depuração quando a grade não aparece
+            try:
+                with open("debug_grid_timeout.html", "w", encoding="utf-8") as f:
+                    f.write(d.page_source)
+            except Exception:
+                pass
+            raise TimeoutException("Grade não ficou pronta (sem linhas nem 'sem registros').")
+
+    def _save_debug(self, tag: str):
+        """Salva screenshot e HTML para diagnóstico."""
+        safe = tag.replace(" ", "_")
+        try:
+            self.driver.save_screenshot(f"debug_{safe}.png")
+        except Exception:
+            pass
+        try:
+            with open(f"debug_{safe}.html", "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+        except Exception:
+            pass
+
+    def _ensure_tela_deslocamento(self):
+        """Garante que estamos na página Deslocamento/Index."""
+        url_ok = self.cfg["tabela"]["url"]
+        if "/Deslocamento/Index" not in (self.driver.current_url or ""):
+            self.driver.get(url_ok)
+        try:
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "form[action*='Deslocamento']"))
+            )
+        except TimeoutException:
+            pass
+
+    def _wait_grid_ready(self, row_sel: str, timeout: int = 12) -> bool:
+        """
+        Espera a grade ficar pronta:
+        - há linhas visíveis (row_sel)
+        - ou aparece alguma indicação de "sem registros".
+        """
+        w, d = self.wait, self.driver
+        try:
+            WebDriverWait(d, timeout).until(lambda drv: (
+                len(drv.find_elements(By.CSS_SELECTOR, row_sel)) > 0 or
+                len(drv.find_elements(By.CSS_SELECTOR, ".dataTables_empty, .empty, td[colspan]")) > 0 or
+                "Sem registros" in (drv.page_source or "")
+            ))
+            return True
+        except TimeoutException:
+            self._save_debug("grid_timeout")
+            return False
+
+    # -------------- período (mês do comprovante) --------------
+    def _fixar_periodo_do_mes(self, quando: datetime):
+        """
+        Define o período para o mês de `quando`.
+        - Se os inputs existem, preenche e clica Buscar.
+        - No Pi/headless (ou layouts sem input), recarrega a página com dataInicialPesquisa/dataFinalPesquisa via GET.
+        """
+        d, w = self.driver, self.wait
+        self._ensure_tela_deslocamento()
+
+        inicio = quando.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        prox = (inicio.replace(day=28) + timedelta(days=4)).replace(day=1)
+        fim = (prox - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+
+        def fdate(dt: datetime) -> str:
+            return f"{dt.day:02d}/{dt.month:02d}/{dt.year}"
+
+        # Tenta inputs direto
+        try:
+            inp_ini = d.find_element(By.CSS_SELECTOR, "input#dataInicialPesquisa, input[name='dataInicialPesquisa']")
+            inp_fim = d.find_element(By.CSS_SELECTOR, "input#dataFinalPesquisa, input[name='dataFinalPesquisa']")
+            btn_busca = d.find_element(By.CSS_SELECTOR, "button.btn.btn-success.mb-2.ml-2, button[type='submit']")
+
+            self._set_input_value_js(inp_ini, fdate(inicio))
+            self._set_input_value_js(inp_fim, fdate(fim))
+            self._scroll_center(btn_busca)
+            self._robust_click(btn_busca)
+            time.sleep(0.8)
+            return
+        except Exception:
+            # Sem inputs? Usa GET com query string (força o mês correto)
+            pass
+
+        base = self.cfg["tabela"]["url"].rstrip("/")
+        qs = urlencode({
+            "dataInicialPesquisa": fdate(inicio),
+            "dataFinalPesquisa": fdate(fim),
+        })
+        d.get(f"{base}?{qs}")
+
+    # -------------- helpers URL/HREF e abrir telas --------------
     def _abs_url(self, href: str) -> str:
         if href.startswith("http"):
             return href
         return urljoin(self.driver.current_url, href)
-    
+
     def abrir_despesas_por_href(self, href: str) -> bool:
         if not href:
             return False
@@ -120,74 +318,11 @@ class PortalClient:
         except TimeoutException:
             return False
 
-
-    # -------------- login / navegação inicial --------------
-    def login(self):
-        c = self.cfg["login"]
-        d = self.driver
-        w = self.wait
-
-        d.get(c["url"])  # https://mobile.ncratleos.com/sb0121/
-        w.until(EC.presence_of_element_located((By.CSS_SELECTOR, c["user_selector"]))).send_keys(
-            os.getenv("PORTAL_USER")
-        )
-        w.until(EC.presence_of_element_located((By.CSS_SELECTOR, c["pass_selector"]))).send_keys(
-            os.getenv("PORTAL_PASS")
-        )
-        self._robust_click(w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, c["submit_selector"]))))
-
-        # Selecionar veículo -> apenas clica em salvar (se existir)
-        try:
-            d.get(self.cfg["veiculo"]["url"])
-            self._robust_click(
-                w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, self.cfg["veiculo"]["salvar_selector"])))
-            )
-        except Exception:
-            pass
-
-        # posiciona na tela de deslocamentos
-        d.get(self.cfg["tabela"]["url"])
-
-    # -------------- período (mês do comprovante) --------------
-    def _set_periodo_mes_da_data(self, quando: datetime):
-        inicio = quando.replace(day=1)
-        prox = (inicio.replace(day=28) + timedelta(days=4)).replace(day=1)
-        fim = prox - timedelta(days=1)
-        self.definir_periodo(inicio, fim)
-
-    def definir_periodo(self, data_inicio: datetime, data_fim: datetime) -> bool:
-        d, w = self.driver, self.wait
-        fmt = lambda dt: f"{dt.day:02d}/{dt.month:02d}/{dt.year}"
-
-        if "/Deslocamento/Index" not in (d.current_url or ""):
-            d.get(self.cfg["tabela"]["url"])
-
-        ini = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#dataInicialPesquisa")))
-        fim = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#dataFinalPesquisa")))
-        btn = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-success.mb-2.ml-2")))
-
-        self._set_input_value_js(ini, fmt(data_inicio))
-        self._set_input_value_js(fim, fmt(data_fim))
-        self._robust_click(btn)
-
-        # pequena confirmação: depois do reload, os campos devem manter as datas
-        try:
-            w.until(lambda drv: fmt(data_inicio) in drv.find_element(By.CSS_SELECTOR, "input#dataInicialPesquisa").get_attribute("value"))
-            w.until(lambda drv: fmt(data_fim) in drv.find_element(By.CSS_SELECTOR, "input#dataFinalPesquisa").get_attribute("value"))
-            return True
-        except Exception:
-            return False
-
-
-    # -------------- parsing de células de data/hora --------------
-    def _parse_cell_dt(self, txt: str) -> datetime:
-        txt = " ".join([p.strip() for p in txt.splitlines() if p.strip()])
-        for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
-            try:
-                return datetime.strptime(txt, fmt)
-            except ValueError:
-                continue
-        raise ValueError("formato de data inesperado")
+    def abrir_pagina_despesas(self, href: str):
+        """Abre diretamente o /Despesa/... pelo href capturado do menu (evita stale/click intercept)."""
+        self.driver.get(href)
+        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/Despesa/New'], a.btn.btn-success")))
+        time.sleep(0.2)
 
     # -------------- menu da linha -> HREF de 'Despesas' --------------
     def _open_menu_and_get_despesas(self, row_el, dt_ini):
@@ -196,7 +331,7 @@ class PortalClient:
         for sel in (
             "button.btn.btn-success.dropdown-toggle",
             "button.btn.dropdown-toggle",
-            "button.dropdown-toggle",
+            "button.dropdown-toggle"
         ):
             try:
                 btn = row_el.find_element(By.CSS_SELECTOR, sel)
@@ -246,146 +381,24 @@ class PortalClient:
         return best or fallback
 
     # -------------- encontrar linha por data/hora (retorna HREF) --------------
-    # def encontrar_linha_por_data_hora(self, alvo: datetime, tipo: str):
-    #     """
-    #     tipo: 'pedagio' ou 'estacionamento'
-    #     Retorna: HREF da opção 'Despesas' da linha correspondente, ou None.
-    #     """
-    #     # sempre garante o mês do comprovante
-    #     self._set_periodo_mes_da_data(alvo)
-
-    #     d, w = self.driver, self.wait
-    #     row_sel = self.cfg["tabela"]["row_selector"]
-
-    #     w.until(EC.visibility_of_element_located((By.CSS_SELECTOR, row_sel)))
-    #     rows = d.find_elements(By.CSS_SELECTOR, row_sel)
-    #     if not rows:
-    #         return None
-
-    #     parsed = []
-    #     for r in rows:
-    #         tds = r.find_elements(By.TAG_NAME, "td")
-    #         if len(tds) < 3:
-    #             continue
-    #         try:
-    #             ini = self._parse_cell_dt(tds[1].text)
-    #             fim = self._parse_cell_dt(tds[2].text)
-    #             parsed.append((r, ini, fim))
-    #         except Exception:
-    #             continue
-
-    #     if tipo == "pedagio":
-    #         delta = timedelta(minutes=10)
-    #         for r, ini, fim in reversed(parsed):
-    #             if ini - delta <= alvo <= fim + delta:
-    #                 href = self._open_menu_and_get_despesas(r, ini)
-    #                 if href:
-    #                     return href
-
-    #     if tipo == "estacionamento":
-    #         for i in range(len(parsed) - 1):
-    #             r, ini, fim = parsed[i]
-    #             _, prox_ini, _ = parsed[i + 1]
-    #             if fim <= alvo <= prox_ini:
-    #                 href = self._open_menu_and_get_despesas(r, ini)
-    #                 if href:
-    #                     return href
-    #         # último deslocamento do dia
-    #         r, ini, fim = parsed[-1]
-    #         if alvo >= fim:
-    #             href = self._open_menu_and_get_despesas(r, ini)
-    #             if href:
-    #                 return href
-
-    #     # fallback: mesma data
-    #     for r, ini, _ in reversed(parsed):
-    #         if ini.date() == alvo.date():
-    #             href = self._open_menu_and_get_despesas(r, ini)
-    #             if href:
-    #                 return href
-    #     return None
-    
-    # def encontrar_linha_por_data_hora(self, alvo: datetime, tipo: str) -> Optional[str]:
-    #     # fixa o mês do comprovante
-    #     inicio = alvo.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    #     prox = (inicio.replace(day=28) + timedelta(days=4)).replace(day=1)
-    #     fim = prox - timedelta(days=1)
-    #     if not self.definir_periodo(inicio, fim):
-    #         return None
-
-    #     d, w = self.driver, self.wait
-    #     row_sel = self.cfg["tabela"]["row_selector"]
-    #     w.until(EC.visibility_of_element_located((By.CSS_SELECTOR, row_sel)))
-    #     rows = d.find_elements(By.CSS_SELECTOR, row_sel)
-    #     if not rows:
-    #         return None
-
-    #     # parse data/hora da grade
-    #     parsed = []
-    #     for r in rows:
-    #         tds = r.find_elements(By.TAG_NAME, "td")
-    #         if len(tds) < 3: 
-    #             continue
-    #         try:
-    #             dt_ini = self._parse_cell_dt(tds[1].text)
-    #             dt_fim = self._parse_cell_dt(tds[2].text)
-    #             parsed.append((r, dt_ini, dt_fim))
-    #         except Exception:
-    #             continue
-
-    #     # regra de casamento
-    #     def match(r_ini, r_fim) -> bool:
-    #         if tipo == "pedagio":
-    #             delta = timedelta(minutes=10)
-    #             return (r_ini - delta) <= alvo <= (r_fim + delta)
-    #         # estacionamento: entre fim da linha e início da próxima viagem
-    #         return r_ini.date() == alvo.date()
-
-    #     # varre de baixo para cima procurando a primeira que casa
-    #     for idx in range(len(parsed) - 1, -1, -1):
-    #         r, r_ini, r_fim = parsed[idx]
-    #         if tipo == "estacionamento":
-    #             prox_ini = parsed[idx + 1][1] if idx + 1 < len(parsed) else None
-    #             ok = (r_fim <= alvo <= prox_ini) if prox_ini else (alvo >= r_fim)
-    #         else:
-    #             ok = match(r_ini, r_fim)
-    #         if not ok:
-    #             continue
-
-    #         # abre dropdown e pega HREF da opção "Despesas" que contenha /Despesa/
-    #         btn = None
-    #         for sel in ("button.btn.btn-success.dropdown-toggle", "td:first-child .dropdown-toggle", ".dropdown-toggle"):
-    #             got = r.find_elements(By.CSS_SELECTOR, sel)
-    #             if got: btn = got[0]; break
-    #         if not btn:
-    #             continue
-
-    #         self._scroll_center(r); self._robust_click(btn)
-
-    #         # menu bootstrap aparece global
-    #         try:
-    #             menu = WebDriverWait(self.driver, 5).until(
-    #                 EC.visibility_of_element_located((By.CSS_SELECTOR, ".dropdown-menu.show"))
-    #             )
-    #         except TimeoutException:
-    #             continue
-
-    #         links = menu.find_elements(By.CSS_SELECTOR, "a.dropdown-item[href*='/Despesa/']")
-    #         if not links:
-    #             continue
-    #         return links[0].get_attribute("href") or None
-
-    #     return None
-    
     def encontrar_linha_por_data_hora(self, alvo: datetime, tipo: str) -> Optional[str]:
         """
         Retorna o HREF da opção 'Despesas' da linha **ancorada no mês do comprovante**.
         Nunca faz fallback para mês atual/última linha. Se não achar, devolve None.
         """
-        d, w = self.driver, self.wait
+        # garante login + navegação correta
+        self.ensure_on_deslocamento_index()
+
+        # fixa o período ANTES de buscar linhas
         self._fixar_periodo_do_mes(alvo)
 
         row_sel = self.cfg["tabela"]["row_selector"]
+
+        # espera robusta da grid
+        if not self._wait_grid_ready(row_sel, timeout=15):
+            raise TimeoutException("Grade não ficou pronta (sem linhas nem 'sem registros').")
+
+        d, w = self.driver, self.wait
         w.until(EC.visibility_of_element_located((By.CSS_SELECTOR, row_sel)))
         rows = d.find_elements(By.CSS_SELECTOR, row_sel)
         if not rows:
@@ -394,16 +407,19 @@ class PortalClient:
         def parse_dt(cell_text: str) -> Optional[datetime]:
             txt = " ".join([p.strip() for p in cell_text.splitlines() if p.strip()])
             for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
-                try: return datetime.strptime(txt, fmt)
-                except ValueError: pass
+                try:
+                    return datetime.strptime(txt, fmt)
+                except ValueError:
+                    pass
             return None
 
         parsed = []
         for r in rows:
             tds = r.find_elements(By.TAG_NAME, "td")
-            if len(tds) < 3: 
+            if len(tds) < 3:
                 continue
-            ini = parse_dt(tds[1].text); fim = parse_dt(tds[2].text)
+            ini = parse_dt(tds[1].text)
+            fim = parse_dt(tds[2].text)
             if ini and fim:
                 parsed.append((r, ini, fim))
 
@@ -411,14 +427,14 @@ class PortalClient:
             return None
 
         # Regras
-        if tipo == "pedagio":
+        if tipo.lower() == "pedagio":
             margem = timedelta(minutes=10)
-            cand = [ (r, ini) for (r, ini, fim) in parsed if (ini - margem) <= alvo <= (fim + margem) ]
+            cand = [(r, ini) for (r, ini, fim) in parsed if (ini - margem) <= alvo <= (fim + margem)]
         else:  # estacionamento
             cand = []
-            for i in range(len(parsed)-1):
+            for i in range(len(parsed) - 1):
                 r, ini, fim = parsed[i]
-                prox_ini = parsed[i+1][1]
+                prox_ini = parsed[i + 1][1]
                 if fim <= alvo <= prox_ini:
                     cand.append((r, ini))
             if not cand:
@@ -429,7 +445,7 @@ class PortalClient:
 
         if not cand:
             # ainda assim: mesma data (sem forçar horário) — mantém no mesmo MÊS
-            cand = [ (r, ini) for (r, ini, fim) in parsed if ini.date() == alvo.date() ]
+            cand = [(r, ini) for (r, ini, fim) in parsed if ini.date() == alvo.date()]
 
         if not cand:
             return None
@@ -438,10 +454,12 @@ class PortalClient:
         r, ini_ref = cand[-1]  # normalmente a mais próxima do alvo
         # botão do menu
         btn = None
-        for sel in ("button.btn.btn-success.dropdown-toggle","td:first-child .dropdown-toggle",".dropdown-toggle"):
+        for sel in ("button.btn.btn-success.dropdown-toggle", "td:first-child .dropdown-toggle", ".dropdown-toggle"):
             found = r.find_elements(By.CSS_SELECTOR, sel)
-            if found: btn = found[0]; break
-        if not btn: 
+            if found:
+                btn = found[0]
+                break
+        if not btn:
             return None
 
         self._scroll_center(r)
@@ -466,19 +484,13 @@ class PortalClient:
             txt = (a.text or "").lower()
             if "/Despesa/" in href:
                 if "dataInicio=" in href and enc_date in href and enc_hhmm in href:
-                    best = href; break
-                if fallback is None: fallback = href
+                    best = href
+                    break
+                if fallback is None:
+                    fallback = href
             elif "despesa" in txt and fallback is None:
                 fallback = href
         return best or fallback
-    
-    def abrir_pagina_despesas(self, href: str):
-        """Abre diretamente o /Despesa/... pelo href capturado do menu (evita stale/click intercept)."""
-        self.driver.get(href)
-        # espera a grade aparecer
-        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/Despesa/New'], a.btn.btn-success")))
-        time.sleep(0.2)
-
 
     # -------------- encontrar "última" linha que tenha Despesas (retorna HREF) --------------
     def encontrar_ultima_linha(self):
@@ -518,166 +530,18 @@ class PortalClient:
     def abrir_despesas(self, href: str):
         self.driver.get(self._abs_url(href))
 
+    # -------------- parser auxiliar --------------
+    def _parse_cell_dt(self, txt: str) -> datetime:
+        txt = " ".join([p.strip() for p in txt.splitlines() if p.strip()])
+        for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+            try:
+                return datetime.strptime(txt, fmt)
+            except ValueError:
+                continue
+        raise ValueError("formato de data inesperado")
+
     # -------------- formulário de despesa --------------
-    # def preencher_e_anexar(self, tipo: str, valor_centavos: int, arquivo: str) -> bool:
-        # d, w = self.driver, self.wait
-
-        # url = d.current_url or ""
-        # if "/Despesa/" not in url:
-        #     return False
-
-        # # /Despesa/Index -> clica em +Nova Despesa
-        # if "/Despesa/Index" in url:
-        #     try:
-        #         btn_sel = "a[href*='/Despesa/New'], a.center-block.btn.btn-success[href*='/Despesa/New']"
-        #         novo = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, btn_sel)))
-        #     except TimeoutException:
-        #         novo = w.until(
-        #             EC.element_to_be_clickable(
-        #                 (By.XPATH, "//a[contains(., '+ Nova Despesa') or contains(., 'Nova Despesa')]")
-        #             )
-        #         )
-        #     self._scroll_center(novo)
-        #     self._robust_click(novo)
-        #     w.until(lambda drv: "/Despesa/New" in (drv.current_url or ""))
-
-        # # select Tipo
-        # tipo_select = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "select#Tipo, select[name='Tipo']")))
-        # sel = Select(tipo_select)
-        # alvo_txt = "2 - Pedagio" if tipo == "pedagio" else "1 - Estacionamento"
-        # try:
-        #     sel.select_by_visible_text(alvo_txt)
-        # except Exception:
-        #     ok = False
-        #     for opt in tipo_select.find_elements(By.TAG_NAME, "option"):
-        #         if (opt.text or "").strip().lower().startswith(alvo_txt.lower()[:3]):
-        #             self._robust_click(opt)
-        #             ok = True
-        #             break
-        #     if not ok:
-        #         return False
-
-        # # valor
-        # valor_input = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#Valor, input[name='Valor']")))
-        # valor_input.clear()
-        # valor_fmt = f"{valor_centavos/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        # valor_input.send_keys(valor_fmt)
-
-        # # anexo
-        # file_input = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']")))
-        # file_input.send_keys(os.path.abspath(arquivo))
-
-        # # salvar
-        # salvar = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
-        # self._scroll_center(salvar)
-        # self._robust_click(salvar)
-
-        # # confirmação: voltar pra /Despesa/Index (ou /Despesa/Editar com card do comprovante)
-        # # 1) se carregou /Despesa/Editar e já mostra o card do comprovante, está ok
-        # try:
-        #     if "/Despesa/Editar" in (d.current_url or ""):
-        #         # normalmente aparece uma seção "Comprovantes" com botão "Excluir Comprovante"
-        #         if d.find_elements(By.XPATH, "//*[contains(., 'Comprovantes')]"):
-        #             return True
-        # except Exception:
-        #     pass
-
-        # # 2) caso padrão: /Despesa/Index com a tabela
-        # try:
-        #     WebDriverWait(d, 10).until(lambda drv: "/Despesa/Index" in (drv.current_url or ""))
-        #     w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
-        #     linhas = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        #     alvo_tipo = "2 - Pedagio" if tipo == "pedagio" else "1 - Estacionamento"
-        #     for tr in linhas:
-        #         tds = tr.find_elements(By.TAG_NAME, "td")
-        #         if not tds:
-        #             continue
-        #         texto = " | ".join(td.text for td in tds)
-        #         if (alvo_tipo in texto) and (valor_fmt in texto):
-        #             return True
-        # except Exception:
-        #     pass
-
-        # return False
-
-    # def preencher_e_anexar(self, tipo: str, valor_centavos: int, arquivo: str, data_evento: Optional[datetime]=None) -> bool:
-    #     d, w = self.driver, self.wait
-
-    #     # só segue se estiver em /Despesa/Index
-    #     if "/Despesa/Index" not in (d.current_url or ""):
-    #         return False
-
-    #     # valida cabeçalho x data_evento, se fornecida
-    #     if data_evento is not None:
-    #         try:
-    #             header = d.find_element(By.CSS_SELECTOR, ".card .card-body").text
-    #             # extrai 'Data Início:' e 'Data Término:' da página
-    #             mi = re.search(r"Data In[ií]cio:\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2}:\d{2})?", header)
-    #             mf = re.search(r"Data T[ée]rmino:\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2}:\d{2})?", header)
-    #             if mi and mf:
-    #                 di = mi.group(1); df = mf.group(1)
-    #                 # se o dia do evento não for o mesmo de início/fim, não lança
-    #                 if (data_evento.strftime("%d/%m/%Y") != di) and (data_evento.strftime("%d/%m/%Y") != df):
-    #                     return False
-    #         except Exception:
-    #             # se não conseguir validar, por segurança aborta
-    #             return False
-
-    #     # botão "+ Nova Despesa"
-    #     try:
-    #         novo = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a[href*='/Despesa/New']")))
-    #     except TimeoutException:
-    #         return False
-    #     self._scroll_center(novo); self._robust_click(novo)
-    #     w.until(lambda drv: "/Despesa/New" in (drv.current_url or ""))
-
-    #     # select tipo
-    #     tipo_select = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "select#Tipo, select[name='Tipo']")))
-    #     alvo_txt = "2 - Pedagio" if tipo == "pedagio" else "1 - Estacionamento"
-    #     try:
-    #         Select(tipo_select).select_by_visible_text(alvo_txt)
-    #     except Exception:
-    #         # fallback startswith
-    #         ok = False
-    #         for opt in tipo_select.find_elements(By.TAG_NAME, "option"):
-    #             if (opt.text or "").strip().lower().startswith(alvo_txt.lower()[:3]):
-    #                 self._robust_click(opt); ok = True; break
-    #         if not ok:
-    #             return False
-
-    #     # valor
-    #     valor_input = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#Valor, input[name='Valor']")))
-    #     valor_input.clear()
-    #     valor_fmt = f"{valor_centavos/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    #     valor_input.send_keys(valor_fmt)
-
-    #     # anexo
-    #     file_input = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']")))
-    #     file_input.send_keys(os.path.abspath(arquivo))
-
-    #     # salvar
-    #     salvar = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
-    #     self._scroll_center(salvar); self._robust_click(salvar)
-
-    #     # confirmação: precisa voltar para /Despesa/Index e aparecer a linha com tipo + valor
-    #     try:
-    #         w.until(lambda drv: "/Despesa/Index" in (drv.current_url or ""))
-    #         w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr")))
-    #         linhas = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-    #         alvo_tipo = "2 - Pedagio" if tipo == "pedagio" else "1 - Estacionamento"
-    #         return any((alvo_tipo in tr.text) and (valor_fmt in tr.text) for tr in linhas)
-    #     except Exception:
-    #         return False
-
-    # --- IMPORTS REQUERIDOS NO TOPO DO ARQUIVO (garanta que existam) ---
-    # from typing import Optional   # (se você já não tiver)
-    # from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, StaleElementReferenceException
-    # import os, time, re
-    # from selenium.webdriver.common.by import By
-    # from selenium.webdriver.support.ui import WebDriverWait, Select
-    # from selenium.webdriver.support import expected_conditions as EC
-
-    def preencher_e_anexar(self, tipo: str, valor_centavos: int, arquivo: str, data_evento=None) -> bool:
+    def preencher_e_anexar(self, tipo: str, valor_centavos: int, arquivo: str, data_evento: Optional[datetime] = None) -> bool:
         """
         Preenche o formulário de despesa (Pedágio / Estacionamento), anexa o arquivo e valida
         no retorno para a grade se a linha foi criada. Retorna True/False.

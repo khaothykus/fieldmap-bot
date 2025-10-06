@@ -6,3 +6,8 @@ comprovantes/
 processados/
 falhos/
 .env
+.stfolder/
+.jpg
+debug_*.html
+debug_*.png
+*.bkp
