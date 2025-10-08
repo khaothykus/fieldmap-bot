@@ -36,11 +36,11 @@ def list_all():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     rows = c.execute("""
-        SELECT rowid, file_hash, nome_arquivo, tipo, data, valor_centavos, created_at
+        SELECT rowid, file_hash, nome_arquivo, tipo, data, valor_centavos, ocr_sig, created_at
         FROM processed ORDER BY rowid DESC
     """).fetchall()
     conn.close()
-    print(tabulate(rows, headers=["id", "file_hash", "nome_arquivo", "tipo", "data", "valor_centavos", "created_at"]))
+    print(tabulate(rows, headers=["id", "file_hash", "nome_arquivo", "tipo", "data", "valor_centavos", "ocr_sig", "created_at"]))
 
 
 def find(term):
@@ -48,12 +48,12 @@ def find(term):
     c = conn.cursor()
     term_like = f"%{term}%"
     rows = c.execute("""
-        SELECT rowid, file_hash, nome_arquivo, tipo, data, valor_centavos, created_at
+        SELECT rowid, file_hash, nome_arquivo, tipo, data, valor_centavos, ocr_sig, created_at
         FROM processed
-        WHERE file_hash LIKE ? OR nome_arquivo LIKE ?
+        WHERE file_hash LIKE ? OR nome_arquivo LIKE ? OR ocr_sig LIKE ?
     """, (term, term_like)).fetchall()
     conn.close()
-    print(tabulate(rows, headers=["id", "file_hash", "nome_arquivo", "tipo", "data", "valor_centavos", "created_at"]))
+    print(tabulate(rows, headers=["id", "file_hash", "nome_arquivo", "tipo", "data", "valor_centavos", "ocr_sig", "created_at"]))
 
 
 def delete(term, yes=False):
@@ -61,9 +61,9 @@ def delete(term, yes=False):
     c = conn.cursor()
     term_like = f"%{term}%"
     to_del = c.execute("""
-        SELECT rowid, file_hash, nome_arquivo, tipo, data, valor_centavos, created_at
+        SELECT rowid, file_hash, nome_arquivo, tipo, data, valor_centavos, ocr_sig, created_at
         FROM processed
-        WHERE file_hash LIKE ? OR nome_arquivo LIKE ?
+        WHERE file_hash LIKE ? OR nome_arquivo LIKE ? OR ocr_sig LIKE ?
     """, (term, term_like)).fetchall()
 
     if not to_del:
@@ -71,7 +71,7 @@ def delete(term, yes=False):
         conn.close()
         return
 
-    print(tabulate(to_del, headers=["id", "file_hash", "nome_arquivo", "tipo", "data", "valor_centavos", "created_at"]))
+    print(tabulate(to_del, headers=["id", "file_hash", "nome_arquivo", "tipo", "data", "valor_centavos", "ocr_sig", "created_at"]))
 
     if yes or input("Confirma exclusão? (y/N) ").lower().startswith("y"):
         ids = [r[0] for r in to_del]

@@ -541,6 +541,115 @@ class PortalClient:
         raise ValueError("formato de data inesperado")
 
     # -------------- formulário de despesa --------------
+    # def preencher_e_anexar(self, tipo: str, valor_centavos: int, arquivo: str, data_evento: Optional[datetime] = None) -> bool:
+    #     """
+    #     Preenche o formulário de despesa (Pedágio / Estacionamento), anexa o arquivo e valida
+    #     no retorno para a grade se a linha foi criada. Retorna True/False.
+    #     """
+    #     d, w = self.driver, self.wait
+
+    #     # 0) Sanidade: precisamos estar em alguma URL de /Despesa/
+    #     url = d.current_url or ""
+    #     if "/Despesa/" not in url:
+    #         return False
+
+    #     # 1) Se estamos na lista (/Despesa/Index), clique em "+ Nova Despesa"
+    #     if "/Despesa/Index" in url:
+    #         try:
+    #             btn_sel = "a[href*='/Despesa/New'], a.center-block.btn.btn-success[href*='/Despesa/New']"
+    #             novo = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, btn_sel)))
+    #         except TimeoutException:
+    #             # fallback por texto
+    #             novo = w.until(EC.element_to_be_clickable((
+    #                 By.XPATH, "//a[contains(., '+ Nova Despesa') or contains(., 'Nova Despesa')]"
+    #             )))
+    #         # rola e clica
+    #         try:
+    #             self._scroll_center(novo)
+    #         except Exception:
+    #             pass
+    #         try:
+    #             self._robust_click(novo)
+    #         except Exception:
+    #             self._js_click(novo)
+
+    #         # aguarda navegar para /Despesa/New
+    #         w.until(lambda drv: "/Despesa/New" in (drv.current_url or ""))
+
+    #     # 2) Já no formulário (/Despesa/New): selecionar Tipo
+    #     tipo_select = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "select#Tipo, select[name='Tipo']")))
+    #     sel = Select(tipo_select)
+    #     alvo_txt = "2 - Pedagio" if tipo.lower() == "pedagio" else "1 - Estacionamento"
+    #     try:
+    #         sel.select_by_visible_text(alvo_txt)
+    #     except Exception:
+    #         ok_opt = False
+    #         for opt in tipo_select.find_elements(By.TAG_NAME, "option"):
+    #             if (opt.text or "").strip().lower().startswith(alvo_txt.lower()[:3]):
+    #                 try:
+    #                     self._robust_click(opt)
+    #                 except Exception:
+    #                     self._js_click(opt)
+    #                 ok_opt = True
+    #                 break
+    #         if not ok_opt:
+    #             return False
+
+    #     # 3) Valor (formatação brasileira)
+    #     valor_input = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#Valor, input[name='Valor']")))
+    #     try:
+    #         valor_input.clear()
+    #     except Exception:
+    #         pass
+    #     valor_fmt = f"{valor_centavos/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    #     valor_input.send_keys(valor_fmt)
+
+    #     # 4) Anexo
+    #     file_input = w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']")))
+    #     file_input.send_keys(os.path.abspath(arquivo))
+
+    #     # 5) Salvar
+    #     salvar = w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
+    #     try:
+    #         self._scroll_center(salvar)
+    #     except Exception:
+    #         pass
+    #     try:
+    #         self._robust_click(salvar)
+    #     except Exception:
+    #         self._js_click(salvar)
+
+    #     # 6) Confirmação pós-submit
+    #     #    a) primeiro tenta voltar para /Despesa/Index
+    #     try:
+    #         w.until(lambda drv: "/Despesa/Index" in (drv.current_url or ""))
+    #     except TimeoutException:
+    #         # se caiu na tela de erro do Save, falha
+    #         if "/Despesa/Save" in (d.current_url or ""):
+    #             return False
+    #         # ainda assim continua para tentar checar a grade
+
+    #     #    b) Validar na grade se há uma linha com tipo + valor
+    #     try:
+    #         # garante que a grade carregou
+    #         w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table, table#datatable, table.dataTable")))
+    #         # pequenas tentativas, pois a linha pode surgir com leve atraso
+    #         for _ in range(8):  # ~4–6s
+    #             linhas = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
+    #             alvo_tipo = "2 - Pedagio" if tipo.lower() == "pedagio" else "1 - Estacionamento"
+    #             for tr in linhas:
+    #                 tds = tr.find_elements(By.TAG_NAME, "td")
+    #                 if not tds:
+    #                     continue
+    #                 txt = " | ".join(td.text for td in tds)
+    #                 if (alvo_tipo in txt) and (valor_fmt in txt):
+    #                     return True
+    #             time.sleep(0.7)
+    #     except Exception:
+    #         pass
+
+    #     return False
+
     def preencher_e_anexar(self, tipo: str, valor_centavos: int, arquivo: str, data_evento: Optional[datetime] = None) -> bool:
         """
         Preenche o formulário de despesa (Pedágio / Estacionamento), anexa o arquivo e valida
@@ -563,7 +672,6 @@ class PortalClient:
                 novo = w.until(EC.element_to_be_clickable((
                     By.XPATH, "//a[contains(., '+ Nova Despesa') or contains(., 'Nova Despesa')]"
                 )))
-            # rola e clica
             try:
                 self._scroll_center(novo)
             except Exception:
@@ -631,20 +739,93 @@ class PortalClient:
 
         #    b) Validar na grade se há uma linha com tipo + valor
         try:
-            # garante que a grade carregou
             w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table, table#datatable, table.dataTable")))
+
+            alvo_tipo = "2 - Pedagio" if tipo.lower() == "pedagio" else "1 - Estacionamento"
+            linha_encontrada = None
+
             # pequenas tentativas, pois a linha pode surgir com leve atraso
             for _ in range(8):  # ~4–6s
                 linhas = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-                alvo_tipo = "2 - Pedagio" if tipo.lower() == "pedagio" else "1 - Estacionamento"
                 for tr in linhas:
                     tds = tr.find_elements(By.TAG_NAME, "td")
                     if not tds:
                         continue
                     txt = " | ".join(td.text for td in tds)
                     if (alvo_tipo in txt) and (valor_fmt in txt):
-                        return True
+                        linha_encontrada = tr
+                        break
+                if linha_encontrada:
+                    break
                 time.sleep(0.7)
+
+            if not linha_encontrada:
+                return False
+
+            # 6.c) **Confirmação extra do comprovante**:
+            # abre a linha (ícone/ação da 1ª coluna) e confere se existe imagem do comprovante
+            try:
+                # tenta um alvo “ação” típico na primeira coluna
+                acao = None
+                for sel in (
+                    "td:first-child a", "td:first-child button",
+                    "a[href*='/Despesa/Editar']", "a[href*='/Despesa/Details']",
+                ):
+                    found = linha_encontrada.find_elements(By.CSS_SELECTOR, sel)
+                    if found:
+                        acao = found[0]
+                        break
+                if acao is None:
+                    # último recurso: duplo clique na linha
+                    try:
+                        self._robust_click(linha_encontrada)
+                        self._robust_click(linha_encontrada)
+                    except Exception:
+                        self._js_click(linha_encontrada)
+                else:
+                    try:
+                        self._scroll_center(linha_encontrada)
+                    except Exception:
+                        pass
+                    try:
+                        self._robust_click(acao)
+                    except Exception:
+                        self._js_click(acao)
+
+                # aguarda tela de edição/detalhe
+                w.until(lambda drv: any(x in (drv.current_url or "") for x in ["/Despesa/Editar", "/Despesa/Details"]))
+
+                # procura por imagem do comprovante
+                try:
+                    w.until(EC.presence_of_element_located((
+                        By.CSS_SELECTOR,
+                        # alguns portais variam bastante; cobrimos amplo
+                        "section,div,form"
+                    )))
+                except TimeoutException:
+                    return False
+
+                # imagens possíveis
+                imgs = d.find_elements(By.CSS_SELECTOR, "img")
+                has_comprovante_img = False
+                for im in imgs:
+                    try:
+                        src = (im.get_attribute("src") or "")
+                        w_nat = d.execute_script("return arguments[0].naturalWidth || 0;", im)
+                        h_nat = d.execute_script("return arguments[0].naturalHeight || 0;", im)
+                        # aceita data URI, blob, ou path do servidor; e precisa ter tamanho natural > 0
+                        if (("data:image" in src) or ("blob:" in src) or ("/File/" in src) or ("/Comprovante" in src)) and (w_nat > 0 and h_nat > 0):
+                            has_comprovante_img = True
+                            break
+                    except Exception:
+                        continue
+
+                return has_comprovante_img
+
+            except Exception:
+                # se não conseguimos abrir/validar, considera falha para permitir retry
+                return False
+
         except Exception:
             pass
 

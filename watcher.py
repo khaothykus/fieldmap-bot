@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from portal_client import PortalClient
 from ocr_utils import extrair_dados_comprovante
 from dedupe import file_hash, already_done, mark_done
+from dedupe import make_ocr_sig, already_done_sig
 
 load_dotenv()
 
@@ -124,6 +125,22 @@ class Watcher:
                 logging.error(f"OCR inconsistente ({motivo}). Nada foi lançado.")
                 return False  # chamador moverá para 'falhos'
 
+            # 3.1) DEDUPE SEMÂNTICO (novo)
+            sig = make_ocr_sig(dados.tipo, dados.data, dados.valor_centavos)
+            if already_done_sig(sig):
+                logging.info("Comprovante já lançado (duplicata por conteúdo OCR).")
+                # ainda assim marcamos o arquivo como “visto” para não voltar
+                mark_done(
+                    h,
+                    nome_arquivo=os.path.basename(path),
+                    tipo=dados.tipo,
+                    data=dados.data.isoformat(),
+                    valor_centavos=dados.valor_centavos,
+                    ocr_sig=sig,
+                )
+                self._mover(path, self.pasta_ok)
+                return True
+            
             # 4) localizar a linha no mês correto e obter o HREF exato de /Despesa/Index
             href = self.pc.encontrar_linha_por_data_hora(dados.data, dados.tipo)
             if not href:
@@ -152,6 +169,7 @@ class Watcher:
                 data=dados.data.isoformat(),
                 valor_centavos=dados.valor_centavos,
                 nome_arquivo=os.path.basename(path),
+                ocr_sig=sig,   # novo
             )
             logging.info("✔ Despesa lançada e comprovante anexado com sucesso.")
             self._mover(path, self.pasta_ok)

@@ -21,7 +21,7 @@ except Exception:
 @dataclass
 class DadosComprovante:
     tipo: str                               # "pedagio" | "estacionamento" | "desconhecido"
-    data: Optional[datetime]                # None se não encontrado
+    data: Optional[datetime]                # None se não encontrado/fora da janela
     valor_centavos: Optional[int]           # None se não encontrado
 
 
@@ -51,8 +51,13 @@ DATAH_SEM_ANO_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 02/10 - 17:25  (sem ano; muito comum na Veloe)
+DATAH_TRACO_SEM_ANO_RE = re.compile(
+    r"(?P<d>\d{1,2})[\/\-](?P<m>\d{1,2})\s*[–\-]\s*(?P<h>\d{1,2}):(?P<mm>\d{2})"
+)
+
 # Palavras-chave para classificar
-KW_PEDAGIO = ("pedágio", "pedagio", "veloe", "sem parar", "semparar", "tag", "praça", "praca")
+KW_PEDAGIO = ("pedágio", "pedagio", "veloe", "sem parar", "semparar", "tag", "praça", "praca", "autoban", "ccr")
 KW_ESTAC  = ("estac", "vaga legal", "zona azul", "zul+", "zul plus", "park", "parquímetro", "parquimetro", "estapar")
 
 
@@ -118,16 +123,37 @@ def _parse_valor(texto: str) -> Optional[int]:
 
 def _inferir_ano_para_mes(m: int) -> int:
     """
-    Infere um ano razoável quando o ticket vem sem ano (ex.: Estapar).
-    Regra: usa ano corrente; se o mês inferido ficar "muito à frente" do mês atual,
-    assume ano anterior (cobre o caso jan (1) lendo dez (12) do ano passado).
+    Infere um ano razoável quando o ticket vem sem ano (ex.: Estapar/Veloe).
+    Regra: usa ano corrente; se o mês inferido ficar MUITO à frente do mês atual,
+    assume ano anterior (cobre o caso jan lendo nov/dez do ano passado).
     """
     now = datetime.now()
     ano = now.year
-    # se estamos em jan/fev e o comprovante veio como nov/dez sem ano, usa ano passado
     if (m - now.month) >= 3:
         ano -= 1
     return ano
+
+
+def _validar_janela_meses(dt: datetime | None) -> Optional[datetime]:
+    """
+    Política combinada com o watcher:
+      - NUNCA aceita data no FUTURO.
+      - Aceita APENAS mês corrente OU mês anterior.
+      - Qualquer outra situação => retorna None (watcher não lança).
+    """
+    if dt is None:
+        return None
+    now = datetime.now()
+    if dt > now:
+        return None
+
+    cur_y, cur_m = now.year, now.month
+    prev_y = cur_y if cur_m > 1 else cur_y - 1
+    prev_m = cur_m - 1 if cur_m > 1 else 12
+
+    if (dt.year, dt.month) in {(cur_y, cur_m), (prev_y, prev_m)}:
+        return dt
+    return None
 
 
 def _parse_data(texto: str) -> Optional[datetime]:
@@ -160,6 +186,19 @@ def _parse_data(texto: str) -> Optional[datetime]:
         except ValueError:
             pass
 
+    # 3) dd/mm - HH:MM  (sem ano; recibos Veloe)
+    m3 = DATAH_TRACO_SEM_ANO_RE.search(texto)
+    if m3:
+        d = int(m3.group("d"))
+        mth = int(m3.group("m"))
+        hh = int(m3.group("h"))
+        mm = int(m3.group("mm"))
+        y = _inferir_ano_para_mes(mth)
+        try:
+            return datetime(y, mth, d, hh, mm, 0)
+        except ValueError:
+            pass
+
     # nada encontrado
     return None
 
@@ -180,13 +219,13 @@ def extrair_dados_comprovante(path_img: str) -> DadosComprovante:
     """
     Lê SOMENTE o conteúdo do arquivo (sem olhar nome) e retorna:
       - tipo ("pedagio"|"estacionamento"|"desconhecido")
-      - data (datetime | None)  -> se não achar, None (o watcher NÃO lança)
-      - valor_centavos (int | None) -> se não achar, None (o watcher NÃO lança)
+      - data (datetime | None) -> None se não achar OU se estiver fora da janela (mês atual/ anterior)
+      - valor_centavos (int | None)
     """
     texto = _ocr_texto(path_img)
     tipo = _classifica_tipo(texto)
     valor = _parse_valor(texto)
-    data = _parse_data(texto)
+    data = _validar_janela_meses(_parse_data(texto))
 
     logging.debug("[OCR] tipo=%s valor=%s data=%s", tipo, valor, data)
 
