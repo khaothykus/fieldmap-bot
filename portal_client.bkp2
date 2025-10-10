@@ -1,9 +1,8 @@
-# portal_client.py
 import os
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import yaml
 from selenium import webdriver
@@ -15,7 +14,9 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
-# Regex para capturar "dd/MM/yyyy HH:mm:ss"
+# ------------------------------------------------------------
+# Regex para "dd/MM/yyyy HH:mm:ss"
+# ------------------------------------------------------------
 DATETIME_RX = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})")
 
 
@@ -23,6 +24,9 @@ DATETIME_RX = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})")
 # Helpers de data/hora
 # ------------------------------------------------------------
 def _br_date_to_dt(txt: str) -> Optional[datetime]:
+    """
+    Converte 'dd/MM/yyyy HH:mm:ss' (ou 'dd/MM/yyyy HH:mm') -> datetime
+    """
     if not txt:
         return None
     txt = txt.strip()
@@ -55,8 +59,8 @@ class PortalClient:
     """
     Cliente Selenium para o portal FieldMap mobile.
     Políticas importantes:
-      - Nunca anexa se não achar a *janela de horário* compatível
-      - Nunca usa “última linha” como fallback
+      - Nunca anexa se não achar a *janela de horário* compatível.
+      - Nunca usa “última linha” como fallback.
     """
 
     def __init__(self, config_path="config.yaml", headless: bool = False):
@@ -75,12 +79,16 @@ class PortalClient:
         self.submit_sel = self.cfg.get("login", {}).get(
             "submit_selector", "button[type='submit']"
         )
+
         self.row_selector = self.cfg.get("tabela", {}).get("row_selector", "table tbody tr")
 
         self.form_tipo_sel = self.cfg.get("form", {}).get("tipo_selector", "select#Tipo")
         self.form_valor_sel = self.cfg.get("form", {}).get("valor_selector", "input#Valor")
         self.form_anexar_sel = self.cfg.get("form", {}).get(
             "anexar_input_selector", "input[type='file']"
+        )
+        self.form_salvar_sel = self.cfg.get("form", {}).get(
+            "salvar_selector", "button.btn.btn-success[type='submit']"
         )
 
         self.driver = self._make_driver(headless=headless)
@@ -102,14 +110,15 @@ class PortalClient:
                 "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
             )
 
-        firefox_bin = os.environ.get("FIREFOX_BIN")  # ex: /usr/bin/firefox-esr
+        # usa caminhos fornecidos via systemd/.env
+        firefox_bin = os.environ.get("FIREFOX_BIN")  # ex.: /usr/bin/firefox-esr
         if firefox_bin:
             o.binary_location = firefox_bin
 
         gecko_path = os.environ.get("GECKODRIVER", "/usr/local/bin/geckodriver")
         service = Service(executable_path=gecko_path)
 
-        # ⚠️ passando Service evita o Selenium Manager (que quebra no aarch64)
+        # passando Service evita o Selenium Manager (problema no aarch64)
         driver = webdriver.Firefox(options=o, service=service)
         return driver
 
@@ -143,6 +152,9 @@ class PortalClient:
 
     # --------------------- Login ---------------------
     def _is_login_page(self) -> bool:
+        """
+        Heurística robusta para saber se estamos na tela de login.
+        """
         try:
             url = (self.driver.current_url or "").rstrip("/")
             if url.endswith("/sb0121") or "/Account/Login" in url:
@@ -160,6 +172,7 @@ class PortalClient:
         if not user or not pwd:
             raise RuntimeError("Credenciais ausentes (.env: PORTAL_USER/PORTAL_PASS).")
 
+        # vai sempre para a URL de login
         self.driver.get(self.login_url)
         self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, self.user_sel)))
 
@@ -169,15 +182,20 @@ class PortalClient:
         u.clear(); u.send_keys(user)
         p.clear(); p.send_keys(pwd)
 
+        # tenta click normal; se falhar, usa JS
         try:
             btn = self.driver.find_element(By.CSS_SELECTOR, self.submit_sel)
             self._robust_click(btn)
         except Exception:
             self.driver.execute_script("document.querySelector(arguments[0])?.click()", self.submit_sel)
 
+        # espera REALMENTE sair da tela de login
         self.wait.until(lambda d: not self._is_login_page())
 
     def ensure_logged(self):
+        """
+        Garante sessão autenticada.
+        """
         if self._is_login_page():
             self.login()
             return
@@ -186,7 +204,7 @@ class PortalClient:
         except Exception:
             self.login()
 
-    # --------------------- Espera/grade ---------------------
+    # --------------------- Grade/lista ---------------------
     def _esperar_grade_pronta(self, timeout: int = None) -> bool:
         """
         Aguarda a grid de Deslocamentos:
@@ -194,7 +212,7 @@ class PortalClient:
         - célula .dataTables_empty = pronta (vazia)
         """
         d = self.driver
-        row_sel = self.cfg["tabela"]["row_selector"]
+        row_sel = self.row_selector
 
         if timeout is None:
             timeout = int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)
@@ -227,7 +245,7 @@ class PortalClient:
                 last_exc = e
                 time.sleep(0.3)
 
-        # debug opcional
+        # dumps de debug
         try:
             with open("debug_grid_timeout.html", "w", encoding="utf-8") as f:
                 f.write(d.page_source)
@@ -241,14 +259,36 @@ class PortalClient:
         raise TimeoutException("Grade não ficou pronta (sem linhas nem 'sem registros').") from last_exc
 
     def ensure_on_deslocamento_index(self):
+        """
+        Vai para /Deslocamento/Index; se cair no login, autentica e volta.
+        """
         self.driver.get(self.base_url)
         if self._is_login_page():
             self.login()
             self.driver.get(self.base_url)
         self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-    # --------------------- Parsing / menu ---------------------
+    # --------------------- Parsing de linha ---------------------
+    def _parse_linha(self, tr) -> Tuple[Optional[datetime], Optional[datetime]]:
+        """
+        Retorna (inicio, fim) das duas primeiras colunas.
+        """
+        try:
+            tds = tr.find_elements(By.TAG_NAME, "td")
+            if len(tds) < 2:
+                return None, None
+            ini = _br_date_to_dt((tds[0].text or "").strip())
+            fim = _br_date_to_dt((tds[1].text or "").strip())
+            return ini, fim
+        except Exception:
+            return None, None
+
     def _open_menu_and_get_despesas(self, row_el, dt_ini: datetime) -> Optional[str]:
+        """
+        Abre o menu da linha e retorna o HREF de /Despesa/.
+        Tenta priorizar o link que já vem com data/hora codificadas.
+        """
+        # botão do dropdown
         btn = None
         for sel in (
             "button.btn.btn-success.dropdown-toggle",
@@ -268,6 +308,7 @@ class PortalClient:
         except Exception:
             self._js_click(btn)
 
+        # menu aberto
         menu = None
         for sel in (".dropdown-menu.show", "ul.dropdown-menu"):
             try:
@@ -280,6 +321,7 @@ class PortalClient:
         if not menu:
             return None
 
+        # procura link de /Despesa/
         links = menu.find_elements(By.CSS_SELECTOR, "a.dropdown-item, a, button")
         best, fallback = None, None
         enc_date = f"{dt_ini.month:02d}%2F{dt_ini.day:02d}%2F{dt_ini.year}"
@@ -300,9 +342,12 @@ class PortalClient:
     # --------------------- Localização da linha por data/hora ---------------------
     def encontrar_linha_por_data_hora(self, dt_evento: datetime, tipo: str) -> Optional[str]:
         """
-        Seleciona a linha correta:
-        - pedagio: janela [ini, fim] do próprio deslocamento
-        - estacionamento: janela [fim_atual, ini_proximo)
+        Seleciona a linha correta para anexar:
+          - pedagio: janela [ini, fim] do próprio deslocamento;
+          - estacionamento: janela [fim_atual, ini_proximo);
+            * no último deslocamento, aceita [fim_ultimo, +inf).
+        Para evitar StaleElementReference, guardamos apenas o ÍNDICE da linha e,
+        na hora do clique, rebuscamos o <tr>.
         """
         d = self.driver
 
@@ -310,7 +355,7 @@ class PortalClient:
         self.ensure_on_deslocamento_index()
         self._fixar_periodo_do_mes(dt_evento)
 
-        # 2) esperar a grade
+        # 2) esperar a grade ficar pronta
         if not self._esperar_grade_pronta(timeout=int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)):
             return None
 
@@ -327,8 +372,8 @@ class PortalClient:
                     time.sleep(0.05)
             return ""
 
-        # snapshot lógico (ini, fim, idx)
-        segmentos = []
+        # 3) snapshot lógico das linhas: (ini, fim, idx)
+        segmentos: List[Tuple[datetime, datetime, int]] = []
         for idx in range(len(rows)):
             try:
                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
@@ -345,6 +390,7 @@ class PortalClient:
                 ini = _br_date_to_dt(_safe_text(tds[0]))
                 fim = _br_date_to_dt(_safe_text(tds[1]))
 
+            # fallback por regex se não parseou direto
             if not ini or not fim:
                 bloco = " | ".join(_safe_text(td) for td in tds[:4])
                 m = DATETIME_RX.findall(bloco)
@@ -363,14 +409,17 @@ class PortalClient:
         if not segmentos:
             return None
 
+        # 4) ordena por início
         segmentos.sort(key=lambda t: t[0])
+
         alvo_tipo = (tipo or "").strip().lower()
 
-        # pedágio
+        # ---------- pedágio: [ini, fim] contém o evento ----------
         if "pedag" in alvo_tipo:
             candidatos = [(ini, fim, idx) for (ini, fim, idx) in segmentos if ini <= dt_evento <= fim]
             if not candidatos:
                 return None
+            # escolhe a menor janela que contém o ponto
             candidatos.sort(key=lambda t: (t[1] - t[0]).total_seconds())
             ini, fim, idx = candidatos[0]
             rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
@@ -379,11 +428,12 @@ class PortalClient:
             tr = rows_now[idx]
             return self._open_menu_and_get_despesas(tr, ini)
 
-        # estacionamento
-        if "estacion" in alvo_tipo:
+        # ----- estacionamento: [fim_atual, ini_proximo) contém o evento -----
+        if "estaciona" in alvo_tipo:
             for i, (ini, fim, idx) in enumerate(segmentos):
                 prox_ini = segmentos[i + 1][0] if i + 1 < len(segmentos) else None
                 if prox_ini:
+                    # janela entre deslocamentos
                     if fim <= dt_evento < prox_ini:
                         rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
                         if idx >= len(rows_now):
@@ -391,6 +441,7 @@ class PortalClient:
                         tr = rows_now[idx]
                         return self._open_menu_and_get_despesas(tr, ini)
                 else:
+                    # último deslocamento: aceita [fim_ultimo, +inf)
                     if dt_evento >= fim:
                         rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
                         if idx >= len(rows_now):
@@ -399,7 +450,7 @@ class PortalClient:
                         return self._open_menu_and_get_despesas(tr, ini)
             return None
 
-        # tipos desconhecidos -> usa janela do deslocamento
+        # tipos desconhecidos -> fallback "tipo pedágio"
         for ini, fim, idx in segmentos:
             if ini <= dt_evento <= fim:
                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
@@ -411,6 +462,10 @@ class PortalClient:
 
     # --------------------- Filtro do período ---------------------
     def _fixar_periodo_do_mes(self, ref: datetime):
+        """
+        Preenche os campos dataInicialPesquisa/dataFinalPesquisa para o mês de 'ref'
+        e dispara 'Pesquisar' se existir.
+        """
         d = self.driver
         try:
             inp_ini = d.find_element(
@@ -433,7 +488,7 @@ class PortalClient:
         except Exception:
             pass
 
-    # --------------------- Preencher + anexar + validação ---------------------
+    # --------------------- Normalização/Tipo ---------------------
     def _norm(self, s: str) -> str:
         repl = (
             ("á", "a"), ("à", "a"), ("â", "a"), ("ã", "a"),
@@ -450,45 +505,33 @@ class PortalClient:
 
     def _choose_tipo_option(self, select_el, tipo: str) -> bool:
         """
-        Seleciona o tipo com alta robustez:
-        - tenta pelos textos (com e sem acento),
-        - depois cai para select_by_value (2=Pedágio, 1=Estacionamento),
-        - e por fim clica via JS disparando eventos.
+        Escolhe a opção correta do select de Tipo:
+        - 'pedágio' => option cujo texto contenha 'pedag'
+        - 'estacionamento' => option contendo 'estaciona'
+        Fallback por atributo value ('2' para pedágio, '1' para estacionamento).
         """
-        alvo = (tipo or "").strip().lower()
-        is_pedagio = "pedag" in alvo
-        textos_possiveis = ["2 - Pedágio", "2 - Pedagio"] if is_pedagio else ["1 - Estacionamento", "1 - Estaciona"]
-        valor_alvo = "2" if is_pedagio else "1"
+        alvo = self._norm(tipo)
+        alvo_key = "pedag" if "pedag" in alvo else "estaciona"
 
-        sel = Select(select_el)
-
-        # 1) por texto
-        for t in textos_possiveis:
-            try:
-                sel.select_by_visible_text(t)
-                self._set_input_value_js(select_el, select_el.get_attribute("value") or "")
-                return True
-            except Exception:
-                pass
-
-        # 2) por value
-        try:
-            sel.select_by_value(valor_alvo)
-            self._set_input_value_js(select_el, valor_alvo)
+        options = select_el.find_elements(By.TAG_NAME, "option")
+        cand = []
+        for opt in options:
+            txtn = self._norm(opt.text)
+            if alvo_key in txtn:
+                cand.append((len(txtn), opt))  # prefere o texto mais específico
+        if cand:
+            cand.sort(reverse=True)
+            self._robust_click(cand[0][1])
             return True
-        except Exception:
-            pass
 
-        # 3) varrendo options
-        opts = select_el.find_elements(By.TAG_NAME, "option")
-        for opt in opts:
-            txt = (opt.text or "").lower()
-            if (is_pedagio and "pedag" in txt) or (not is_pedagio and "estacion" in txt):
+        wanted_val = "2" if alvo_key == "pedag" else "1"
+        for opt in options:
+            if (opt.get_attribute("value") or "").strip() == wanted_val:
                 self._robust_click(opt)
-                self._set_input_value_js(select_el, opt.get_attribute("value") or "")
                 return True
         return False
 
+    # --------------------- Abrir despesas por HREF ---------------------
     def abrir_despesas_por_href(self, href: str) -> bool:
         self.ensure_logged()
         self.driver.get(href)
@@ -498,15 +541,22 @@ class PortalClient:
         except TimeoutException:
             return False
 
+    # --------------------- Preencher + anexar + validação ---------------------
     def preencher_e_anexar(
         self, tipo: str, valor_centavos: int, arquivo: str, data_evento: Optional[datetime] = None
     ) -> bool:
+        """
+        Preenche o formulário de despesa, anexa e valida no retorno:
+          (1) existe uma linha com tipo+valor e
+          (2) há seção de 'Comprovantes' visível ao abrir a edição.
+        """
         d, w = self.driver, self.wait
 
         url = d.current_url or ""
         if "/Despesa/" not in url:
             return False
 
+        # se estamos na lista, clicar em +Nova Despesa
         if "/Despesa/Index" in url:
             try:
                 btn_sel = "a[href*='/Despesa/New'], a.center-block.btn.btn-success[href*='/Despesa/New']"
@@ -521,11 +571,14 @@ class PortalClient:
             self._robust_click(novo)
             w.until(lambda drv: "/Despesa/New" in (drv.current_url or ""))
 
-        # Tipo robusto
+        # Tipo tolerante
         tipo_select = w.until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "select#Tipo, select[name='Tipo']"))
         )
-        if not self._choose_tipo_option(tipo_select, tipo):
+        try:
+            if not self._choose_tipo_option(tipo_select, tipo):
+                return False
+        except Exception:
             return False
 
         # Valor (pt-BR)
@@ -558,29 +611,30 @@ class PortalClient:
             if "/Despesa/Save" in (d.current_url or ""):
                 return False
 
-        # ---------- Validação normalizada ----------
+        # Validação: existe linha com tipo+valor?
         try:
             w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table, table#datatable, table.dataTable")))
-            is_pedagio = "pedag" in self._norm(tipo)
-            alvo_tipo_norm = "pedag" if is_pedagio else "estacion"
-            for _ in range(12):  # ~7s
+            for _ in range(10):
                 linhas = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
+                alvo_key = "pedag" if "pedag" in self._norm(tipo) else "estacion"
                 for tr in linhas:
                     tds = tr.find_elements(By.TAG_NAME, "td")
                     if not tds:
                         continue
-                    txt_norm = self._norm(" | ".join(td.text or "" for td in tds))
-                    if (alvo_tipo_norm in txt_norm) and (self._norm(valor_fmt) in txt_norm):
-                        # abre/checa comprovantes
-                        href = self._open_menu_and_get_despesas(tr, _br_date_to_dt(tds[0].text) or datetime.now())
+                    txt = " | ".join((td.text or "") for td in tds)
+                    if (alvo_key in txt.lower()) and (valor_fmt in txt):
+                        # Validação extra: abrir a linha recém criada e conferir o anexo
+                        ref_dt = _br_date_to_dt((tds[0].text or "").strip()) or datetime.now()
+                        href = self._open_menu_and_get_despesas(tr, ref_dt)
                         if not href:
-                            return True
+                            return True  # já bateu tipo+valor
                         self.driver.get(href.replace("/Index", "/Editar"))
                         try:
-                            w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#Comprovantes, div#Comprovantes")))
+                            w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div#Comprovantes, #Comprovantes")))
                         except TimeoutException:
                             return True
-                        return True
+                        if "Comprovantes" in (d.page_source or ""):
+                            return True
                 time.sleep(0.6)
         except Exception:
             pass

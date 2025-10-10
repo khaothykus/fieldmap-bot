@@ -11,9 +11,15 @@ veiculo:
 tabela:
   url: "https://mobile.ncratleos.com/sb0121/Deslocamento/Index"
   row_selector: "table tbody tr"
+  wait_ready_seconds: 30
 
 form:
   tipo_selector: "select#Tipo"
+  # form:
+  # tipo_selector: "select#Tipo"
+  # tipo_values:
+  #   estacionamento: "1"
+  #   pedagio: "2"
   valor_selector: "input#Valor"
   anexar_input_selector: "input[type='file']"
   salvar_selector: "button.btn.btn-success[type='submit']"
