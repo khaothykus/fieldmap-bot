@@ -56,9 +56,23 @@ DATAH_TRACO_SEM_ANO_RE = re.compile(
     r"(?P<d>\d{1,2})[\/\-](?P<m>\d{1,2})\s*[–\-]\s*(?P<h>\d{1,2}):(?P<mm>\d{2})"
 )
 
-# Palavras-chave para classificar
-KW_PEDAGIO = ("pedágio", "pedagio", "veloe", "sem parar", "semparar", "tag", "praça", "praca", "autoban", "ccr")
-KW_ESTAC  = ("estac", "vaga legal", "zona azul", "zul+", "zul plus", "park", "parquímetro", "parquimetro", "estapar")
+# Mercado Pago: "Data da passagem 09/10/2025 - 09:08"
+MP_DATA_PASSAGEM_RE = re.compile(
+    r"data\s+da\s+passagem\s+(\d{2})/(\d{2})/(\d{4})\s*[-–]\s*(\d{2}):(\d{2})",
+    re.IGNORECASE
+)
+
+# Palavras-chave para classificar (NÃO usar "ultrapasse")
+KW_PEDAGIO = (
+    "pedágio", "pedagio", "veloe", "sem parar", "semparar",
+    "praça", "praca", "autoban", "ccr", "ecosul", "concessionária", "concessionaria"
+)
+KW_ESTAC  = (
+    "estac", "vaga legal", "zona azul", "zul+", "zul plus",
+    "park", "parquímetro", "parquimetro", "estapar", "shopping"
+)
+# Palavras neutras que NÃO devem influenciar tipo
+KW_NEUTRAS = ("ultrapasse", "mercado pago", "mercadopago", "comprovante de pagamento")
 
 
 # -------------------------------
@@ -157,6 +171,15 @@ def _validar_janela_meses(dt: datetime | None) -> Optional[datetime]:
 
 
 def _parse_data(texto: str) -> Optional[datetime]:
+    # 0) Mercado Pago — priorizar "Data da passagem ..."
+    m_mp = MP_DATA_PASSAGEM_RE.search(texto)
+    if m_mp:
+        d, mth, y, hh, mm = map(int, m_mp.groups())
+        try:
+            return datetime(y, mth, d, hh, mm, 0)
+        except ValueError:
+            pass
+
     # 1) data completa
     m = DATAH_RE.search(texto)
     if m:
@@ -205,6 +228,9 @@ def _parse_data(texto: str) -> Optional[datetime]:
 
 def _classifica_tipo(texto: str) -> str:
     low = texto.lower()
+    # remove termos neutros para não enviesar
+    for t in KW_NEUTRAS:
+        low = low.replace(t, "")
     if any(k in low for k in KW_PEDAGIO):
         return "pedagio"
     if any(k in low for k in KW_ESTAC):
@@ -236,15 +262,40 @@ def extrair_dados_comprovante(path_img: str) -> DadosComprovante:
     )
 
 
+# # -------------------------------
+# # CLI de teste rápido
+# # -------------------------------
+# if __name__ == "__main__":
+#     import sys
+#     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+#     if len(sys.argv) < 2:
+#         print("Uso: python ocr_utils.py <caminho_da_imagem>")
+#         sys.exit(1)
+#     img = sys.argv[1]
+#     dados = extrair_dados_comprovante(img)
+#     print(dados)
+
 # -------------------------------
-# CLI de teste rápido
+# CLI de teste rápido (lote)
 # -------------------------------
 if __name__ == "__main__":
-    import sys
+    import sys, os
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if len(sys.argv) < 2:
-        print("Uso: python ocr_utils.py <caminho_da_imagem>")
-        sys.exit(1)
-    img = sys.argv[1]
-    dados = extrair_dados_comprovante(img)
-    print(dados)
+
+    if len(sys.argv) == 1:
+        pasta = "ocr_test_files"
+        if not os.path.isdir(pasta):
+            print("Uso: python ocr_utils.py <imagem>  ou  coloque arquivos em ./ocr_test_files/")
+            sys.exit(1)
+        print(f"🔍 Varredura em: {pasta}/")
+        for fname in sorted(os.listdir(pasta)):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".png", ".pdf")):
+                continue
+            path = os.path.join(pasta, fname)
+            dados = extrair_dados_comprovante(path)
+            print(f"{fname:<45} → tipo={dados.tipo:<15} data={dados.data} valor_centavos={dados.valor_centavos}")
+    else:
+        img = sys.argv[1]
+        dados = extrair_dados_comprovante(img)
+        print(dados)
+
