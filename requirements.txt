@@ -1,5 +1,6 @@
 # Core
-python-dotenv==1.0.1
+# python-dotenv==1.0.1
+python-dotenv
 PyYAML==6.0.3
 
 # Web automation

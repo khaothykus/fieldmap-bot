@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_HOME="$HOME"
 APP_DIR="$APP_HOME/fieldmap-bot"
-VENV_DIR="$APP_HOME/.venvs/ocrbot"
+VENV_DIR="$APP_DIR/.venv"
 GECKO_VERSION="v0.35.0"
 GECKO_PATH="/usr/local/bin/geckodriver"
 
@@ -70,42 +70,63 @@ deactivate
 echo "==> [4/6] Criando pastas de comprovantes..."
 mkdir -p \
   "$APP_DIR" \
-  "$APP_HOME/comprovantes" \
-  "$APP_HOME/comprovantes_processados" \
-  "$APP_HOME/comprovantes_falhos"
+  "$APP_DIR/comprovantes" \
+  "$APP_DIR/comprovantes_processados" \
+  "$APP_DIR/comprovantes_falhos"
 
 echo "==> [5/6] Instalando service systemd..."
-sudo tee /etc/systemd/system/ocrwatcher.service >/dev/null <<UNIT
+sudo tee /etc/systemd/system/fieldmap-bot.service >/dev/null <<'EOF'
 [Unit]
-Description=Watcher OCR portal (FieldMap)
+Description=Fieldmap Bot (OCR + Selenium)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
+Environment=OCR_DEBUG=0
+Environment=OCR_DEBUG_DIR=/home/pi/fieldmap-bot/_ocr_debug
 Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/fieldmap-bot
+
+# Carrega variáveis do .env (o "-" evita falha se o arquivo não existir)
+EnvironmentFile=-/home/pi/fieldmap-bot/.env
+
+# Ambiente
 Environment=HEADLESS=1
-Environment=LOG_PATH=/home/pi/fieldmap-bot/ocrbot.log
-ExecStart=/home/pi/.venvs/ocrbot/bin/python /home/pi/fieldmap-bot/watcher.py
+Environment=PYTHONUNBUFFERED=1
+# Garante PATH com geckodriver/firefox padrão
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Início do bot
+ExecStart=/home/pi/fieldmap-bot/.venv/bin/python -u /home/pi/fieldmap-bot/watcher.py
+
+# Reinício resiliente
 Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=process
+
+# Logs: ficam no journal (journalctl). Se quiser arquivo, descomente as 2 linhas abaixo
+# StandardOutput=append:/home/pi/fieldmap-bot/fieldmap-bot.log
+# StandardError=append:/home/pi/fieldmap-bot/fieldmap-bot.log
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
 
 echo "==> [6/6] Habilitando e (opcionalmente) iniciando..."
 sudo systemctl daemon-reload
-sudo systemctl enable ocrwatcher.service
+sudo systemctl enable fieldmap-bot.service
 # se quiser já subir agora:
-sudo systemctl start ocrwatcher.service || true
+sudo systemctl start fieldmap-bot.service || true
 
 echo
 echo "✅ fieldmap-bot instalado."
 echo "• Código:     $APP_DIR"
 echo "• venv:       $VENV_DIR"
 echo "• geckodriver: $GECKO_PATH"
-echo "• serviço:    ocrwatcher.service"
+echo "• serviço:    fieldmap-bot.service"
 echo
 echo "Logs em tempo real:"
-echo "  sudo journalctl -u ocrwatcher.service -f"
+echo "  sudo journalctl -u fieldmap-bot.service -f"

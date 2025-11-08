@@ -10,8 +10,8 @@ veiculo:
 
 tabela:
   url: "https://mobile.ncratleos.com/sb0121/Deslocamento/Index"
-  row_selector: "table tbody tr"
-  wait_ready_seconds: 30
+  row_selector: "table#datatable tbody tr"
+  wait_ready_seconds: 45
 
 form:
   tipo_selector: "select#Tipo"

@@ -9,6 +9,11 @@ from ocr_utils import extrair_dados_comprovante
 from dedupe import file_hash, already_done, mark_done, already_done_semantic
 from selenium.common.exceptions import TimeoutException
 
+from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="/home/pi/fieldmap-bot/.env")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -18,6 +23,42 @@ logging.basicConfig(
 COMPROVANTES_DIR = "comprovantes"
 PROCESSADOS_DIR = "processados"
 FALHOS_DIR = "falhos"
+
+# --- arquivos a ignorar / validações de imagem -------------------------
+IGNORED_PREFIXES = ('.', '.syncthing.')
+IGNORED_SUFFIXES = ('.tmp',)
+ALLOWED_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
+def _should_ignore(p: Path) -> bool:
+    """Ignora temporários/ocultos/sincronia e extensões não suportadas."""
+    name = p.name
+    if name.startswith(IGNORED_PREFIXES):
+        return True
+    if name.endswith(IGNORED_SUFFIXES):
+        return True
+    if p.suffix.lower() not in ALLOWED_EXTS:
+        return True
+    return False
+
+def _wait_until_stable(p: Path, attempts: int = 6, interval: float = 0.5) -> bool:
+    """
+    Aguarda o arquivo “assentar” (ex.: Syncthing ainda gravando).
+    True = estável; False = ainda variando ou sumiu.
+    """
+    try:
+        prev = (p.stat().st_size, p.stat().st_mtime_ns)
+    except FileNotFoundError:
+        return False
+    for _ in range(attempts):
+        time.sleep(interval)
+        try:
+            cur = (p.stat().st_size, p.stat().st_mtime_ns)
+        except FileNotFoundError:
+            return False
+        if cur == prev:
+            return True
+        prev = cur
+    return False
 
 
 class Watcher:
@@ -45,93 +86,88 @@ class Watcher:
     # loop de arquivos
     # -----------------------
     def processar(self, path: str):
+        p = Path(path)
+
+        # 0) Filtros de arquivos que não devem ser processados
+        if _should_ignore(p):
+            logger.info("Ignorando arquivo não-processável: %s", p)
+            return
+
+        # 1) Debounce: aguarda estabilizar (evita pegar .tmp do Syncthing)
+        if not _wait_until_stable(p):
+            logger.info("Arquivo ainda não estável (pode estar sendo gravado): %s", p)
+            return
+            
         logging.info(f"Novo arquivo: {path}")
         try:
-            # Dedupe por hash físico (processados)
+            # dedupe por hash físico (processados)
             h = file_hash(path)
             if already_done(h):
-                logging.info("Arquivo já processado (hash conhecido) — movendo para 'processados/'.")
+                logging.info("Arquivo já processado (hash conhecido) — ignorando.")
                 self._mover(path, PROCESSADOS_DIR)
                 return
 
             # OCR
             dados = extrair_dados_comprovante(path)
-            logging.info(
-                f"OCR: tipo={dados.tipo} data={dados.data} valor_centavos={dados.valor_centavos}"
-            )
+            logging.info(f"OCR: tipo={dados.tipo} data={dados.data} valor_centavos={dados.valor_centavos}")
 
-            # Dedupe semântico (conteúdo OCR)
-            if dados.data and dados.valor_centavos and (dados.tipo or "").strip():
-                if already_done_semantic(dados.tipo, dados.data, dados.valor_centavos):
-                    logging.info("Comprovante já lançado (duplicata por conteúdo OCR) — 'processados/'.")
-                    self._mover(path, PROCESSADOS_DIR)
-                    return
-
-            # Localizar a linha exata (regras por tipo no PortalClient)
-            try:
-                href = self.pc.encontrar_linha_por_data_hora(dados.data, dados.tipo)
-            except TimeoutException:
-                logging.warning(
-                    "Grade não ficou pronta (sem linhas nem 'sem registros'). Provável delay de sincronismo."
-                )
+            # >>> BLINDAGEM: se não tiver tipo/data/valor, não segue para o portal
+            if (not dados.data) or (not dados.valor_centavos) or (dados.tipo == "desconhecido"):
+                logging.error("OCR insuficiente (tipo/data/valor ausentes). Nada foi lançado — 'falhos'.")
                 self._mover(path, FALHOS_DIR)
                 return
 
+            # dedupe semântico (conteúdo OCR)
+            if already_done_semantic(dados.tipo, dados.data, dados.valor_centavos):
+                logging.info("Comprovante já lançado (duplicata por conteúdo OCR).")
+                self._mover(path, PROCESSADOS_DIR)
+                return
+
+            # localizar a linha exata pela janela de horário (sem fallback!)
+            href = self.pc.encontrar_linha_por_data_hora(dados.data, dados.tipo)
             if not href:
-                logging.error(
-                    f"Não encontrei deslocamento compatível para tipo='{dados.tipo}'. "
-                    "Nada foi lançado — vai para 'falhos' para reprocesso."
-                )
+                logging.error("Não encontrei deslocamento compatível (janela de horário/mês). "
+                            "Nada foi lançado — ficará em 'falhos' para reprocesso.")
                 self._mover(path, FALHOS_DIR)
                 return
 
-            # Abrir /Despesa/Index e lançar
+            # abrir /Despesa/Index e lançar
             ok = self.pc.abrir_despesas_por_href(href) and self.pc.preencher_e_anexar(
                 dados.tipo, dados.valor_centavos, path, data_evento=dados.data
             )
 
             if not ok:
-                logging.error("Validação falhou ou não houve confirmação. Nada foi lançado — 'falhos'.")
+                logging.error("Validação falhou ou não houve confirmação. Nada foi lançado.")
                 self._mover(path, FALHOS_DIR)
                 return
 
-            # Sucesso
+            # sucesso
             mark_done(
                 h,
                 tipo=dados.tipo,
-                data=dados.data.isoformat() if dados.data else "",
-                valor_centavos=dados.valor_centavos or 0,
+                data=dados.data.isoformat(),
+                valor_centavos=dados.valor_centavos,
                 nome_arquivo=os.path.basename(path),
             )
-            # também grava a “impressão digital” semântica (se disponível)
-            try:
-                from dedupe import mark_done_semantic  # pode não existir em versões antigas
-                if dados.data and dados.valor_centavos and (dados.tipo or "").strip():
-                    mark_done_semantic(dados.tipo, dados.data, dados.valor_centavos)
-            except Exception:
-                # não impede o fluxo se não houver a função
-                pass
+            from dedupe import mark_done_semantic
+            mark_done_semantic(dados.tipo, dados.data, dados.valor_centavos)
 
             logging.info("✔ Despesa lançada e comprovante anexado com sucesso.")
             self._mover(path, PROCESSADOS_DIR)
 
         except Exception as e:
             logging.exception(f"ERRO ao processar {path}: {e}")
-            # Garanta que, em qualquer falha, o arquivo não fique “preso” em comprovantes/
             try:
                 base = os.path.basename(path)
                 os.makedirs(FALHOS_DIR, exist_ok=True)
                 destino = os.path.join(FALHOS_DIR, base)
                 if os.path.abspath(path) != os.path.abspath(destino):
                     try:
-                        os.replace(path, destino)  # sobrescreve atômico
+                        os.replace(path, destino)
                     except FileNotFoundError:
-                        # se o file_input capturou/deletou o arquivo, ignore
                         pass
             except Exception:
-                logging.warning(
-                    f"Falha ao mover '{path}' de volta para '{FALHOS_DIR}' (talvez já tenha sido movido)."
-                )
+                logging.warning(f"Falha ao mover '{path}' para '{FALHOS_DIR}' (talvez já tenha sido movido).")
 
     # -----------------------
     # watch loop
