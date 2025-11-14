@@ -23,3 +23,12 @@ form:
   valor_selector: "input#Valor"
   anexar_input_selector: "input[type='file']"
   salvar_selector: "button.btn.btn-success[type='submit']"
+
+tabela:
+  wait_ready_seconds: 30     # quanto esperar a grade “aparecer”
+  max_scrolls: 30            # limite de tentativas de scroll/paginação
+  stabilize_passes: 2        # quantas medições iguais seguidas encerram o scroll
+  scroll_sleep: 0.35         # pausa entre scrolls (s)
+matching:
+  estacion_pre_end_slack_sec: 300   # 5 minutos antes do fim do deslocamento
+  estacion_post_end_slack_sec: 300  # até 5 minutos depois do fim

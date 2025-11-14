@@ -144,47 +144,146 @@ class PortalClient:
             self.login()
 
     # ---------- grade ----------
+    # def _esperar_grade_pronta(self, timeout: int | None = None) -> bool:
+    #     d = self.driver
+    #     row_sel = self.row_selector
+    #     if timeout is None:
+    #         timeout = int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)
+
+    #     table_sel = "table, table#datatable, table.dataTable"
+    #     empty_sel = "td.dataTables_empty, tr.dataTables_empty, .dataTables_empty"
+
+    #     end_time = time.time() + timeout
+    #     last_exc = None
+    #     while time.time() < end_time:
+    #         try:
+    #             WebDriverWait(d, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, table_sel)))
+    #             rows = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #             if rows:
+    #                 return True
+    #             if d.find_elements(By.CSS_SELECTOR, empty_sel):
+    #                 return False
+    #             time.sleep(0.4)
+    #         except (TimeoutException, StaleElementReferenceException) as e:
+    #             last_exc = e
+    #             time.sleep(0.5)
+    #         except Exception as e:
+    #             last_exc = e
+    #             time.sleep(0.3)
+
+    #     # dumps de debug
+    #     try:
+    #         with open("debug_grade_timeout.html", "w", encoding="utf-8") as f:
+    #             f.write(d.page_source)
+    #         try:
+    #             d.save_screenshot("debug_grade_timeout.png")
+    #         except Exception:
+    #             pass
+    #     except Exception:
+    #         pass
+
+    #     raise TimeoutException("Grade não ficou pronta (sem linhas nem 'sem registros').") from last_exc
+
+    # def ensure_on_deslocamento_index(self):
+    #     self.driver.get(self.base_url)
+    #     if self._is_login_page():
+    #         self.login()
+    #         self.driver.get(self.base_url)
+    #     self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
     def _esperar_grade_pronta(self, timeout: int | None = None) -> bool:
+        """Garante que a tabela apareceu (mesmo vazia). Não roda scroll aqui."""
         d = self.driver
-        row_sel = self.row_selector
         if timeout is None:
             timeout = int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)
 
         table_sel = "table, table#datatable, table.dataTable"
         empty_sel = "td.dataTables_empty, tr.dataTables_empty, .dataTables_empty"
+        row_sel = self.row_selector
 
-        end_time = time.time() + timeout
+        end = time.time() + timeout
         last_exc = None
-        while time.time() < end_time:
+        while time.time() < end:
             try:
-                WebDriverWait(d, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, table_sel)))
-                rows = d.find_elements(By.CSS_SELECTOR, row_sel)
-                if rows:
+                WebDriverWait(d, 8).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, table_sel))
+                )
+                # Se já há linhas ou explicitamente “sem registros”, a grade está pronta
+                if d.find_elements(By.CSS_SELECTOR, row_sel):
                     return True
                 if d.find_elements(By.CSS_SELECTOR, empty_sel):
-                    return False
-                time.sleep(0.4)
-            except (TimeoutException, StaleElementReferenceException) as e:
-                last_exc = e
-                time.sleep(0.5)
+                    return False  # grade vazia
+                time.sleep(0.3)
             except Exception as e:
                 last_exc = e
                 time.sleep(0.3)
 
-        # dumps de debug
+        # dumps opcionais de debug
         try:
             with open("debug_grade_timeout.html", "w", encoding="utf-8") as f:
                 f.write(d.page_source)
-            try:
-                d.save_screenshot("debug_grade_timeout.png")
-            except Exception:
-                pass
+            d.save_screenshot("debug_grade_timeout.png")
         except Exception:
             pass
+        raise TimeoutException("Grade não ficou pronta.") from last_exc
 
-        raise TimeoutException("Grade não ficou pronta (sem linhas nem 'sem registros').") from last_exc
+    def _carregar_todas_as_linhas(self) -> list:
+        """
+        Faz scroll até o fim para carregar TODAS as linhas (infinite scroll/paginação).
+        Para quando a contagem estabilizar por N passes ou atingir max_scrolls.
+        """
+        d = self.driver
+        row_sel = self.row_selector
+        tcfg = self.cfg.get("tabela", {}) if hasattr(self, "cfg") else {}
+
+        max_scrolls = int(tcfg.get("max_scrolls", 20) or 20)
+        stabilize_passes = int(tcfg.get("stabilize_passes", 2) or 2)
+        sleep_between = float(tcfg.get("scroll_sleep", 0.35) or 0.35)
+
+        stable_hits = 0
+        last_count = -1
+        for _ in range(max_scrolls):
+            rows = d.find_elements(By.CSS_SELECTOR, row_sel)
+            cur_count = len(rows)
+
+            # tenta acionar “mostrar mais/seguinte” se existir
+            clicked_extra = False
+            for sel in (
+                "button.load-more, .load-more button, a.load-more",
+                "button:contains('Mostrar mais')",
+                "a:contains('Próximo'), button:contains('Próximo')",
+                "ul.pagination li a[rel='next']",
+            ):
+                try:
+                    btns = d.find_elements(By.CSS_SELECTOR, sel)
+                except Exception:
+                    btns = []
+                for b in btns:
+                    if b.is_displayed() and b.is_enabled():
+                        self._robust_click(b)
+                        clicked_extra = True
+                        break
+                if clicked_extra:
+                    break
+
+            # scroll até o fim
+            d.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(sleep_between)
+
+            rows = d.find_elements(By.CSS_SELECTOR, row_sel)
+            new_count = len(rows)
+            if new_count == last_count:
+                stable_hits += 1
+                if stable_hits >= stabilize_passes:
+                    return rows
+            else:
+                stable_hits = 0
+            last_count = new_count
+
+        return d.find_elements(By.CSS_SELECTOR, row_sel)
 
     def ensure_on_deslocamento_index(self):
+        """Navega para a tela, garante login e o body pronto."""
         self.driver.get(self.base_url)
         if self._is_login_page():
             self.login()
@@ -238,25 +337,190 @@ class PortalClient:
         return best or fallback
 
     # ---------- localizar por data/hora ----------
+    # def encontrar_linha_por_data_hora(self, dt_evento: datetime, tipo: str) -> Optional[str]:
+    #     """
+    #     Retorna o **href** para a tela de Despesas da linha correta.
+    #     pedágio: janela [ini, fim] do deslocamento.
+    #     estacionamento: janela [fim_atual, ini_proximo).
+    #     """
+    #     if not dt_evento:
+    #         return None
+    #     d = self.driver
+    #     self.ensure_on_deslocamento_index()
+    #     self._fixar_periodo_do_mes(dt_evento)
+
+    #     if not self._esperar_grade_pronta(timeout=int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)):
+    #         return None
+
+    #     row_sel = self.row_selector
+    #     rows = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #     if not rows:
+    #         return None
+
+    #     def _safe_text(el) -> str:
+    #         for _ in range(2):
+    #             try:
+    #                 return (el.text or "").strip()
+    #             except Exception:
+    #                 time.sleep(0.05)
+    #         return ""
+
+    #     segmentos = []
+    #     for idx in range(len(rows)):
+    #         try:
+    #             rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #             if idx >= len(rows_now):
+    #                 break
+    #             tr = rows_now[idx]
+    #             tds = tr.find_elements(By.TAG_NAME, "td")
+    #         except StaleElementReferenceException:
+    #             continue
+
+    #         ini = None
+    #         fim = None
+    #         if len(tds) >= 2:
+    #             ini = _br_date_to_dt(_safe_text(tds[0]))
+    #             fim = _br_date_to_dt(_safe_text(tds[1]))
+
+    #         if not ini or not fim:
+    #             bloco = " | ".join(_safe_text(td) for td in tds[:4])
+    #             m = _DATETIME_RX.findall(bloco)
+    #             if m:
+    #                 try:
+    #                     ini = datetime.strptime(" ".join(m[0]), "%d/%m/%Y %H:%M:%S")
+    #                     fim = datetime.strptime(" ".join(m[1] if len(m) > 1 else m[0]), "%d/%m/%Y %H:%M:%S")
+    #                 except Exception:
+    #                     ini = fim = None
+
+    #         if ini and fim:
+    #             if fim < ini:
+    #                 ini, fim = fim, ini
+    #             segmentos.append((ini, fim, idx))
+
+    #     if not segmentos:
+    #         return None
+
+    #     segmentos.sort(key=lambda t: t[0])
+    #     alvo_tipo = (tipo or "").strip().lower()
+
+    #     # log auxiliar (igual ao que você viu)
+    #     try:
+    #         dump = [f"[{i}] {a[0].strftime('%d/%m %H:%M:%S')}–{a[1].strftime('%d/%m %H:%M:%S')}" for i, a in enumerate(segmentos)]
+    #         logger.info("[FM] dt_evento=%s | segmentos=%s", dt_evento.strftime("%d/%m %H:%M:%S"), ", ".join(dump))
+    #     except Exception:
+    #         pass
+
+    #     # pedágio
+    #     if "pedag" in alvo_tipo:
+    #         candidatos = [(ini, fim, idx) for (ini, fim, idx) in segmentos if ini <= dt_evento <= fim]
+    #         if not candidatos:
+    #             return None
+    #         candidatos.sort(key=lambda t: (t[1] - t[0]).total_seconds())
+    #         ini, fim, idx = candidatos[0]
+    #         rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #         if idx >= len(rows_now):
+    #             return None
+    #         tr = rows_now[idx]
+    #         return self._open_menu_and_get_despesas(tr, ini)
+
+    #     # estacionamento
+    #     # if "estacion" in alvo_tipo:
+    #     #     for i, (ini, fim, idx) in enumerate(segmentos):
+    #     #         prox_ini = segmentos[i + 1][0] if i + 1 < len(segmentos) else None
+    #     #         if prox_ini:
+    #     #             if fim <= dt_evento < prox_ini:
+    #     #                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #     #                 if idx >= len(rows_now):
+    #     #                     return None
+    #     #                 tr = rows_now[idx]
+    #     #                 return self._open_menu_and_get_despesas(tr, ini)
+    #     #         else:
+    #     #             if dt_evento >= fim:
+    #     #                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #     #                 if idx >= len(rows_now):
+    #     #                     return None
+    #     #                 tr = rows_now[idx]
+    #     #                 return self._open_menu_and_get_despesas(tr, ini)
+    #     #     return None
+
+    #     # # desconhecido -> usa janela do deslocamento
+    #     # for ini, fim, idx in segmentos:
+    #     #     if ini <= dt_evento <= fim:
+    #     #         rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #     #         if idx >= len(rows_now):
+    #     #             return None
+    #     #         tr = rows_now[idx]
+    #     #         return self._open_menu_and_get_despesas(tr, ini)
+    #     # return None
+
+    #     # estacionamento (com tolerância de borda configurável)
+    #     if "estacion" in alvo_tipo:
+    #         mcfg = self.cfg.get("matching", {}) if hasattr(self, "cfg") else {}
+    #         pre_slack = int(mcfg.get("estacion_pre_end_slack_sec", 900))   # 15 min
+    #         post_slack = int(mcfg.get("estacion_post_end_slack_sec", 300)) # 5  min
+
+    #         for i, (ini, fim, idx) in enumerate(segmentos):
+    #             # 1) se o evento caiu dentro da própria janela do deslocamento, use essa linha
+    #             if ini <= dt_evento <= fim:
+    #                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #                 if idx < len(rows_now):
+    #                     tr = rows_now[idx]
+    #                     return self._open_menu_and_get_despesas(tr, ini)
+
+    #             # 2) janela de tolerância ao redor do FIM
+    #             janela_ini = fim - timedelta(seconds=pre_slack)
+    #             janela_fim = fim + timedelta(seconds=post_slack)
+    #             if janela_ini <= dt_evento <= janela_fim:
+    #                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #                 if idx < len(rows_now):
+    #                     tr = rows_now[idx]
+    #                     return self._open_menu_and_get_despesas(tr, ini)
+
+    #             # 3) regra original: entre fim atual e início do próximo
+    #             prox_ini = segmentos[i + 1][0] if i + 1 < len(segmentos) else None
+    #             if prox_ini:
+    #                 if fim <= dt_evento < prox_ini:
+    #                     rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #                     if idx < len(rows_now):
+    #                         tr = rows_now[idx]
+    #                         return self._open_menu_and_get_despesas(tr, ini)
+    #             else:
+    #                 # último deslocamento do período
+    #                 if dt_evento >= fim:
+    #                     rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+    #                     if idx < len(rows_now):
+    #                         tr = rows_now[idx]
+    #                         return self._open_menu_and_get_despesas(tr, ini)
+
+    #         return None
+
     def encontrar_linha_por_data_hora(self, dt_evento: datetime, tipo: str) -> Optional[str]:
         """
-        Retorna o **href** para a tela de Despesas da linha correta.
-        pedágio: janela [ini, fim] do deslocamento.
-        estacionamento: janela [fim_atual, ini_proximo).
+        Retorna o href da tela de Despesas da linha correta.
+        Consolidado: chama _esperar_grade_pronta() uma única vez e depois carrega todas as linhas
+        com _carregar_todas_as_linhas().
         """
         if not dt_evento:
             return None
-        d = self.driver
+
         self.ensure_on_deslocamento_index()
         self._fixar_periodo_do_mes(dt_evento)
 
-        if not self._esperar_grade_pronta(timeout=int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)):
-            return None
+        # 1) espera grade ficar pronta (sem duplicar lógica)
+        ready = self._esperar_grade_pronta(
+            timeout=int(self.cfg.get("tabela", {}).get("wait_ready_seconds", 30) or 30)
+        )
+        if not ready:
+            return None  # mês sem registros
 
-        row_sel = self.row_selector
-        rows = d.find_elements(By.CSS_SELECTOR, row_sel)
+        # 2) carrega todas as linhas antes de analisar
+        rows = self._carregar_todas_as_linhas()
         if not rows:
             return None
+
+        # ---- a partir daqui, mesma lógica de parsing/segmentos que você já tem ----
+        d = self.driver
+        row_sel = self.row_selector
 
         def _safe_text(el) -> str:
             for _ in range(2):
@@ -274,44 +538,35 @@ class PortalClient:
                     break
                 tr = rows_now[idx]
                 tds = tr.find_elements(By.TAG_NAME, "td")
-            except StaleElementReferenceException:
+            except Exception:
                 continue
 
-            ini = None
-            fim = None
+            from datetime import datetime as _dt
+            ini = fim = None
             if len(tds) >= 2:
+                # suas funções auxiliares existentes:
                 ini = _br_date_to_dt(_safe_text(tds[0]))
                 fim = _br_date_to_dt(_safe_text(tds[1]))
-
-            if not ini or not fim:
-                bloco = " | ".join(_safe_text(td) for td in tds[:4])
-                m = _DATETIME_RX.findall(bloco)
-                if m:
-                    try:
-                        ini = datetime.strptime(" ".join(m[0]), "%d/%m/%Y %H:%M:%S")
-                        fim = datetime.strptime(" ".join(m[1] if len(m) > 1 else m[0]), "%d/%m/%Y %H:%M:%S")
-                    except Exception:
-                        ini = fim = None
-
+            if ini and fim and fim < ini:
+                ini, fim = fim, ini
             if ini and fim:
-                if fim < ini:
-                    ini, fim = fim, ini
                 segmentos.append((ini, fim, idx))
 
         if not segmentos:
             return None
 
         segmentos.sort(key=lambda t: t[0])
-        alvo_tipo = (tipo or "").strip().lower()
 
-        # log auxiliar (igual ao que você viu)
+        # log auxiliar
         try:
             dump = [f"[{i}] {a[0].strftime('%d/%m %H:%M:%S')}–{a[1].strftime('%d/%m %H:%M:%S')}" for i, a in enumerate(segmentos)]
             logger.info("[FM] dt_evento=%s | segmentos=%s", dt_evento.strftime("%d/%m %H:%M:%S"), ", ".join(dump))
         except Exception:
             pass
 
-        # pedágio
+        alvo_tipo = (tipo or "").lower()
+
+        # — Pedágio: dentro da janela do deslocamento
         if "pedag" in alvo_tipo:
             candidatos = [(ini, fim, idx) for (ini, fim, idx) in segmentos if ini <= dt_evento <= fim]
             if not candidatos:
@@ -321,38 +576,40 @@ class PortalClient:
             rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
             if idx >= len(rows_now):
                 return None
-            tr = rows_now[idx]
-            return self._open_menu_and_get_despesas(tr, ini)
+            return self._open_menu_and_get_despesas(rows_now[idx], ini)
 
-        # estacionamento
-        if "estacion" in alvo_tipo:
-            for i, (ini, fim, idx) in enumerate(segmentos):
-                prox_ini = segmentos[i + 1][0] if i + 1 < len(segmentos) else None
-                if prox_ini:
-                    if fim <= dt_evento < prox_ini:
-                        rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
-                        if idx >= len(rows_now):
-                            return None
-                        tr = rows_now[idx]
-                        return self._open_menu_and_get_despesas(tr, ini)
-                else:
-                    if dt_evento >= fim:
-                        rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
-                        if idx >= len(rows_now):
-                            return None
-                        tr = rows_now[idx]
-                        return self._open_menu_and_get_despesas(tr, ini)
-            return None
-
-        # desconhecido -> usa janela do deslocamento
-        for ini, fim, idx in segmentos:
+        # — Estacionamento: tolerância configurável ao redor do fim
+        mcfg = self.cfg.get("matching", {}) if hasattr(self, "cfg") else {}
+        pre_slack = int(mcfg.get("estacion_pre_end_slack_sec", 900))   # 15 min
+        post_slack = int(mcfg.get("estacion_post_end_slack_sec", 300)) # 5  min
+        for i, (ini, fim, idx) in enumerate(segmentos):
+            # caiu dentro do deslocamento
             if ini <= dt_evento <= fim:
                 rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
-                if idx >= len(rows_now):
-                    return None
-                tr = rows_now[idx]
-                return self._open_menu_and_get_despesas(tr, ini)
+                if idx < len(rows_now):
+                    return self._open_menu_and_get_despesas(rows_now[idx], ini)
+
+            # janela de tolerância em torno do fim
+            if (fim - timedelta(seconds=pre_slack)) <= dt_evento <= (fim + timedelta(seconds=post_slack)):
+                rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+                if idx < len(rows_now):
+                    return self._open_menu_and_get_despesas(rows_now[idx], ini)
+
+            # regra “entre fim atual e início do próximo”
+            prox_ini = segmentos[i + 1][0] if i + 1 < len(segmentos) else None
+            if prox_ini:
+                if fim <= dt_evento < prox_ini:
+                    rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+                    if idx < len(rows_now):
+                        return self._open_menu_and_get_despesas(rows_now[idx], ini)
+            else:
+                if dt_evento >= fim:
+                    rows_now = d.find_elements(By.CSS_SELECTOR, row_sel)
+                    if idx < len(rows_now):
+                        return self._open_menu_and_get_despesas(rows_now[idx], ini)
+
         return None
+
 
     # ---------- filtro período ----------
     def _fixar_periodo_do_mes(self, ref: datetime):
